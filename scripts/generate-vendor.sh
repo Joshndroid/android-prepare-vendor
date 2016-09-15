@@ -23,6 +23,11 @@ declare -a S_SLINKS_SRC
 declare -a S_SLINKS_DST
 hasStandAloneSymLinks=false
 
+# Some shared libraries under are required as dependencies so we need to create
+# individual modules for them
+declare -a DSO_MODULES
+hasDsoModules=false
+
 abort() {
   # If debug keep work directory for bugs investigation
   if [[ "$-" == *x* ]]; then
@@ -38,9 +43,14 @@ cat <<_EOF
   Usage: $(basename "$0") [options]
     OPTIONS:
       -i|--input      : Root path of extracted /system & /vendor partitions
-      -o|--output     : Path to save vendor blobs & makefiles in AOSP
-                        compatible structure
-      -b|--blobs-list : Text file with list of propriatery blobs to copy
+      -o|--output     : Path to save vendor blobs & makefiles in AOSP compatible structure
+      --blobs-list    : Text file with list of proprietary blobs to copy
+      --dep-dso-list  : Text file with list of shared libraries that required to be
+                        included as a separate module
+      --flags-list    : Text file with list of Makefile flags to be appended at
+                        'BoardConfigVendor.mk'
+      --extra-modules : Text file additional modules to be appended at master vendor
+                        'Android.mk'
     INFO:
       * Output should be moved/synced with AOSP root, unless -o is AOSP root
 _EOF
@@ -59,8 +69,9 @@ verify_input() {
 }
 
 get_device_codename() {
-  local device=$(grep 'ro.product.device=' "$1" | cut -d '=' -f2 | \
-                 tr '[:upper:]' '[:lower:]')
+  local device
+
+  device=$(grep 'ro.product.device=' "$1" | cut -d '=' -f2 | tr '[:upper:]' '[:lower:]')
   if [[ "$device" == "" ]]; then
     echo "[-] Device string not found"
     abort 1
@@ -69,8 +80,9 @@ get_device_codename() {
 }
 
 get_vendor() {
-  local vendor=$(grep 'ro.product.manufacturer=' "$1" | \
-                 cut -d '=' -f2 | tr '[:upper:]' '[:lower:]')
+  local vendor
+
+  vendor=$(grep 'ro.product.manufacturer=' "$1" | cut -d '=' -f2 | tr '[:upper:]' '[:lower:]')
   if [[ "$vendor" == "" ]]; then
     echo "[-] Device codename string not found"
     abort 1
@@ -110,6 +122,7 @@ extract_blobs() {
   local dst=""
   local dstDir=""
   local outBase=""
+  local openTag=""
 
   while read -r file
   do
@@ -157,7 +170,7 @@ extract_blobs() {
     # Some vendor xml's don't satisfy xmllint running from AOSP.
     # Better apply fix-up here
     if [[ "${file##*.}" == "xml" ]]; then
-      local openTag=$(grep '^<?xml version' "$outBase/$dst")
+      openTag=$(grep '^<?xml version' "$outBase/$dst")
       grep -v '^<?xml version' "$outBase/$dst" > "$TMP_WORK_DIR/xml_fixup.tmp"
       echo "$openTag" > "$outBase/$dst"
       cat "$TMP_WORK_DIR/xml_fixup.tmp" >> "$outBase/$dst"
@@ -189,10 +202,15 @@ gen_vendor_blobs_mk() {
 
   while read -r file
   do
-    # Skip APKs & JARs
+    # Skip files that have dedicated target module (APKs, JARs & selected shared libraries)
     fileExt="${file##*.}"
     if [[ "$fileExt" == "apk" || "$fileExt" == "jar" ]]; then
       continue
+    fi
+    if [[ $hasDsoModules = true && "$fileExt" == "so" ]]; then
+      if array_contains "$file" "${DSO_MODULES[@]}"; then
+        continue
+      fi
     fi
 
     # Skip standalone symbolic links if available
@@ -254,9 +272,11 @@ gen_board_cfg_mk() {
   local DEVICE="$3"
   local OUTMK="$OUTDIR/BoardConfigVendor.mk"
 
+  local v_img_sz
+
   # First lets check if vendor partition size has been extracted from
   # previous data extraction script
-  local v_img_sz="$(has_vendor_size "$INDIR")"
+  v_img_sz="$(has_vendor_size "$INDIR")"
 
   # If not found, fail over to last known value from hardcoded entries
   if [[ "$v_img_sz" == "" ]]; then
@@ -277,12 +297,17 @@ gen_board_cfg_mk() {
     echo ""
     echo 'BOARD_VENDORIMAGE_FILE_SYSTEM_TYPE := ext4'
     echo "BOARD_VENDORIMAGE_PARTITION_SIZE := $v_img_sz"
+
+    # Update with user selected extra flags
+    grep -Ev '(^#|^$)' "$MK_FLAGS_LIST" || true
   } > "$OUTMK"
 }
 
 zip_needs_resign() {
   local INFILE="$1"
-  local output=$(jarsigner -verify "$INFILE" 2>&1 || abort 1)
+  local output
+
+  output=$(jarsigner -verify "$INFILE" 2>&1 || abort 1)
   if [[ "$output" =~ .*"contains unsigned entries".* ]]; then
     return 0
   else
@@ -392,7 +417,6 @@ gen_mk_for_bytecode() {
   local suffix=""
   local priv=""
   local cert=""
-  local opt=""
   local stem=""
   local lcMPath=""
   local appDir=""
@@ -438,23 +462,27 @@ gen_mk_for_bytecode() {
       stem="package.apk"
     fi
 
-    # Annotate extra privilleges when required
+    # Annotate extra privileges when required
     if [[ "$RELSUBROOT" == "priv-app" ]]; then
       priv='LOCAL_PRIVILEGED_MODULE := true'
     fi
 
-    # APKs under /vendor should not be optimized and always use the
-    # PRESIGNED cert
+    # APKs under /vendor should not be optimized & always use the PRESIGNED cert
     if [[ "$fileExt" == "apk" && "$RELROOT" == "vendor" ]]; then
       cert="PRESIGNED"
-      opt='LOCAL_DEX_PREOPT := false'
     elif [[ "$fileExt" == "apk" ]]; then
-      # All other APKs have been repaired (de-optimized from oat) & thus
-      # need resign
+      # All other APKs have been repaired & thus need resign
       cert="platform"
     else
       # Framework JAR's don't contain signatures, so annotate to skip signing
       cert="PRESIGNED"
+    fi
+
+    # Some defensive checks in case configuration files are not aligned with the
+    # existing assumptions about the signing entities
+    if [[ "$RELSUBROOT" == "priv-app" && "$RELROOT" == "vendor" ]]; then
+      echo "[-] Privileged modules under /vendor/priv-app are not supported"
+      abort 1
     fi
 
     # Some prebuilt APKs have also prebuilt JNI libs that are stored under
@@ -506,9 +534,7 @@ gen_mk_for_bytecode() {
         echo "$priv"
       fi
       echo "LOCAL_MODULE_SUFFIX := $suffix"
-      if [[ "$opt" != "" ]]; then
-        echo "$opt"
-      fi
+      echo "LOCAL_DEX_PREOPT := false"
       echo 'include $(BUILD_PREBUILT)'
 
       # Append rules for APK lib symlinks if present
@@ -517,7 +543,7 @@ gen_mk_for_bytecode() {
       fi
     } >> "$OUTMK"
 
-    # Also add pkgName to runtime array update at the end the vendor mk
+    # Also add pkgName to runtime array to append later the vendor mk
     PKGS=("${PKGS[@]-}" "$pkgName")
   done <<< "$(find "$OUTBASE/$RELROOT/$RELSUBROOT" -maxdepth 2 -type f -iname '*.apk' -o -iname '*.jar')"
 
@@ -550,11 +576,171 @@ gen_mk_for_bytecode() {
   fi
 }
 
+gen_mk_for_shared_libs() {
+  local INDIR="$1"
+  local RELROOT="$2"
+  local OUTBASE="$3"
+  local VENDOR="$4"
+  local OUTMK="$5"
+
+  local VENDORMK="$OUTBASE/device-vendor.mk"
+  local -a PKGS
+  local hasPKGS=false
+  local -a MULTIDSO
+  local hasMultiDSO=false
+
+  # If target is multi-lib we first iterate the 64bit libs to detect possible
+  # dual target modules
+  if [ -d "$OUTBASE/$RELROOT/lib64" ]; then
+    while read -r file
+    do
+      local dsoRelRoot=""
+      local dso32RelRoot=""
+      local dsoFile=""
+      local dsoName=""
+      local dsoSrc=""
+      local dso32Src=""
+
+      dsoRelRoot=$(dirname "$file" | sed "s#$OUTBASE/##")
+      dsoFile=$(basename "$file")
+      dsoName=$(basename "$file" ".so")
+      dsoSrc="$dsoRelRoot/$dsoFile"
+
+      dso32RelRoot=$(echo "$dsoRelRoot" | sed "s#lib64#lib#")
+      dso32Src="$dso32RelRoot/$dsoFile"
+
+      # TODO: Instead of iterate all and skip, go with the whitelist array
+      # directly. This is a temporarily hack to ensure that approach is working
+      # as expected before finalizing
+      if [[ "$RELROOT" == "proprietary" ]]; then
+        dsoRealRel="$(echo "$dsoSrc" | sed "s#proprietary/#system/#")"
+      else
+        dsoRealRel="$dsoSrc"
+      fi
+
+      if [ $hasDsoModules = true ]; then
+        if ! array_contains "$dsoRealRel" "${DSO_MODULES[@]}"; then
+          continue
+        fi
+      fi
+
+      {
+        echo ""
+        echo 'include $(CLEAR_VARS)'
+        echo "LOCAL_MODULE := $dsoName"
+        echo 'LOCAL_MODULE_TAGS := optional'
+        echo "LOCAL_MODULE_OWNER := $VENDOR"
+        echo "LOCAL_SRC_FILES := $dsoSrc"
+        echo "LOCAL_MODULE_CLASS := SHARED_LIBRARIES"
+        echo "LOCAL_MODULE_SUFFIX := .so"
+
+        if [[ "$RELROOT" == "vendor" ]]; then
+          echo "LOCAL_PROPRIETARY_MODULE := true"
+        fi
+
+        # In case 32bit version present - upgrade to dual target
+        if [ -f "$OUTBASE/$dso32Src" ]; then
+          echo "LOCAL_MULTILIB := both"
+          echo "LOCAL_SRC_FILES_32 := $dso32Src"
+
+          # Cache dual-targets so that we don't include again when searching for
+          # 32bit only libs under a 64bit system
+          MULTIDSO=("${MULTIDSO[@]-}" "$dso32Src")
+          hasMultiDSO=true
+        else
+          echo "LOCAL_MULTILIB := first"
+        fi
+
+        echo 'include $(BUILD_PREBUILT)'
+      } >> "$OUTMK"
+
+      # Also add pkgName to runtime array to append later the vendor mk
+      PKGS=("${PKGS[@]-}" "$dsoName")
+      hasPKGS=true
+    done <<< "$(find "$OUTBASE/$RELROOT/lib64" -maxdepth 1 -type f -iname 'lib*.so')"
+  fi
+
+  # Then iterate the 32bit libs excluding the ones already included as dual targets
+  while read -r file
+  do
+    local dsoRelRoot=""
+    local dsoFile=""
+    local dsoName=""
+    local dsoSrc=""
+
+    dsoRelRoot=$(dirname "$file" | sed "s#$OUTBASE/##")
+    dsoFile=$(basename "$file")
+    dsoName=$(basename "$file" ".so")
+    dsoSrc="$dsoRelRoot/$dsoFile"
+
+    # TODO: Instead of iterate all and skip, go with the whitelist array
+    # directly. This is a temporarily hack to ensure that approach is working
+    # as expected before finalizing
+    if [[ "$RELROOT" == "proprietary" ]]; then
+      dsoRealRel="$(echo "$dsoSrc" | sed "s#proprietary/#system/#")"
+    else
+      dsoRealRel="$dsoSrc"
+    fi
+
+    if [ $hasDsoModules = true ]; then
+      if ! array_contains "$dsoRealRel" "${DSO_MODULES[@]}"; then
+        continue
+      fi
+    fi
+
+    if [ $hasMultiDSO = true ]; then
+      if array_contains "$dsoSrc" "${MULTIDSO[@]}"; then
+        continue
+      fi
+    fi
+
+    {
+      echo ""
+      echo 'include $(CLEAR_VARS)'
+      echo "LOCAL_MODULE := $dsoName"
+      echo 'LOCAL_MODULE_TAGS := optional'
+      echo "LOCAL_MODULE_OWNER := $VENDOR"
+      echo "LOCAL_SRC_FILES := $dsoSrc"
+      echo "LOCAL_MODULE_CLASS := SHARED_LIBRARIES"
+      echo "LOCAL_MODULE_SUFFIX := .so"
+
+      if [[ "$RELROOT" == "vendor" ]]; then
+        echo "LOCAL_PROPRIETARY_MODULE := true"
+      fi
+
+      echo "LOCAL_MULTILIB := 32"
+      echo 'include $(BUILD_PREBUILT)'
+    } >> "$OUTMK"
+
+    # Also add pkgName to runtime array to append later the vendor mk
+    PKGS=("${PKGS[@]-}" "$dsoName")
+    hasPKGS=true
+  done <<< "$(find "$OUTBASE/$RELROOT/lib" -maxdepth 1 -type f -iname 'lib*.so')"
+
+  # Update vendor mk
+  if [ $hasPKGS = true ]; then
+    {
+      echo ""
+      echo "# Prebuilt shared libraries from '$RELROOT'"
+      echo 'PRODUCT_PACKAGES += \'
+      for pkg in ${PKGS[@]}
+      do
+        echo "    $pkg \\"
+      done
+    }  >> "$VENDORMK"
+    sed '$s/ \\//' "$VENDORMK" > "$VENDORMK.tmp"
+    mv "$VENDORMK.tmp" "$VENDORMK"
+  fi
+}
+
 trap "abort 1" SIGINT SIGTERM
 
 INPUT_DIR=""
 OUTPUT_DIR=""
 BLOBS_LIST=""
+DEP_DSO_BLOBS_LIST=""
+MK_FLAGS_LIST=""
+EXTRA_MODULES=""
 
 DEVICE=""
 VENDOR=""
@@ -580,8 +766,20 @@ do
       OUTPUT_DIR=$(echo "$2" | sed 's:/*$::')
       shift
       ;;
-    -b|--blobs-list)
+    --blobs-list)
       BLOBS_LIST="$2"
+      shift
+      ;;
+    --dep-dso-list)
+      DEP_DSO_BLOBS_LIST="$2"
+      shift
+      ;;
+    --flags-list)
+      MK_FLAGS_LIST="$2"
+      shift
+      ;;
+    --extra-modules)
+      EXTRA_MODULES="$2"
       shift
       ;;
     *)
@@ -601,7 +799,19 @@ if [[ "$OUTPUT_DIR" == "" || ! -d "$OUTPUT_DIR" ]]; then
   usage
 fi
 if [[ "$BLOBS_LIST" == "" || ! -f "$BLOBS_LIST" ]]; then
-  echo "[-] Vendor proprietary blobs list file not found"
+  echo "[-] Vendor proprietary-blobs file not found"
+  usage
+fi
+if [[ "$DEP_DSO_BLOBS_LIST" == "" || ! -f "$DEP_DSO_BLOBS_LIST" ]]; then
+  echo "[-] Vendor dep-dso-proprietary file not found"
+  usage
+fi
+if [[ "$MK_FLAGS_LIST" == "" || ! -f "$MK_FLAGS_LIST" ]]; then
+  echo "[-] Vendor vendor-config file not found"
+  usage
+fi
+if [[ "$EXTRA_MODULES" == "" || ! -f "$EXTRA_MODULES" ]]; then
+  echo "[-] Vendor extra modules file not found"
   usage
 fi
 
@@ -618,15 +828,22 @@ echo "[*] Generating blobs for vendor/$VENDOR/$DEVICE"
 OUTPUT_VENDOR="$OUTPUT_DIR/vendor/$VENDOR/$DEVICE"
 PROP_EXTRACT_BASE="$OUTPUT_VENDOR/proprietary"
 if [ -d "$OUTPUT_VENDOR" ]; then
-  rm -rf "$OUTPUT_VENDOR"/*
+  rm -rf "${OUTPUT_VENDOR:?}"/*
 fi
 mkdir -p "$PROP_EXTRACT_BASE"
 
+# Update from DSO_MODULES array from DEP_DSO_BLOBS_LIST file
+entries=$(grep -Ev '(^#|^$)' "$DEP_DSO_BLOBS_LIST" | wc -l | tr -d ' ')
+if [ $entries -gt 0 ]; then
+  readarray -t DSO_MODULES < <(grep -Ev '(^#|^$)' "$DEP_DSO_BLOBS_LIST")
+  hasDsoModules=true
+fi
+
 # Copy device specific files from input
-echo "[*] Copying files to '$OUTPUT_VENDOR' ..."
+echo "[*] Copying files to '$OUTPUT_VENDOR'"
 extract_blobs "$BLOBS_LIST" "$INPUT_DIR" "$OUTPUT_VENDOR"
 
-# Generate $DEVICE-vendor-blobs.mk makefile (all prebuilts except APKs/JARs)
+# Generate $DEVICE-vendor-blobs.mk makefile (plain files that don't require a target module)
 echo "[*] Generating '$DEVICE-vendor-blobs.mk' makefile"
 gen_vendor_blobs_mk "$BLOBS_LIST" "$OUTPUT_VENDOR" "$VENDOR"
 
@@ -638,8 +855,8 @@ gen_dev_vendor_mk "$OUTPUT_VENDOR"
 echo "[*] Generating 'BoardConfigVendor.mk'"
 gen_board_cfg_mk "$INPUT_DIR" "$OUTPUT_VENDOR" "$DEVICE"
 
-# Iterate over directories with bytecode & generate a unified Android.mk file
-echo "[*] Generating 'Android.mk' ..."
+# Iterate over directories with bytecode and generate a unified Android.mk file
+echo "[*] Generating 'Android.mk'"
 
 OUTMK="$OUTPUT_VENDOR/Android.mk"
 {
@@ -665,7 +882,21 @@ if [ $hasStandAloneSymLinks = true ]; then
   gen_standalone_symlinks "$INPUT_DIR" "$OUTPUT_VENDOR" "$VENDOR" "$OUTMK"
 fi
 
-echo "" >> "$OUTMK"
-echo "endif" >> "$OUTMK"
+# Iterate over directories with shared libraries and update the unified Android.mk file
+if [ $hasDsoModules = true ]; then
+  echo "[*] Gathering data for shared library (.so) pre-built modules"
+  for root in "vendor" "proprietary"
+  do
+    gen_mk_for_shared_libs "$INPUT_DIR" "$root" "$OUTPUT_VENDOR" "$VENDOR" "$OUTMK"
+  done
+fi
+
+{
+  # Append extra modules
+  echo ""
+  cat "$EXTRA_MODULES"
+  echo ""
+  echo "endif"
+} >> "$OUTMK"
 
 abort 0

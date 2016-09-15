@@ -1,1 +1,20 @@
 .DS_Store
+
+# Ignore merged / intermediate files & generated data
+angler/*
+!angler/config
+
+bullhead/*
+!bullhead/config
+
+flounder/*
+!flounder/config
+
+# Due to large files they're downloaded at manual step
+# and not part of git files
+hostTools/Linux/*.zip
+hostTools/Linux/bin/oatdump
+hostTools/Linux/lib*
+hostTools/Darwin/*.zip
+hostTools/Darwin/bin/oatdump
+hostTools/Darwin/lib*

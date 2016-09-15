@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 #  Extract system & vendor images from factory archive
-#  after reverting from sparse
+#  after converting from sparse to raw
 #
 
 set -e # fail on unhandled error
@@ -9,7 +9,7 @@ set -u # fail on undefined variable
 #set -x # debug
 
 readonly TMP_WORK_DIR=$(mktemp -d /tmp/android_img_extract.XXXXXX) || exit 1
-declare -a sysTools=("tar" "find" "unzip" "mount" "su" "uname" "rsync" "fdisk")
+declare -a sysTools=("tar" "find" "unzip" "uname" "du" "stat" "tr" "cut")
 
 abort() {
   # If debug keep work dir for bugs investigation
@@ -25,10 +25,14 @@ usage() {
 cat <<_EOF
   Usage: $(basename "$0") [options]
     OPTIONS:
-      -i|--input    : archive with factory images as downloaded from
+      -i|--input    : Archive with factory images as downloaded from
                       Google Nexus images website
       -o|--output   : Path to save contents extracted from images
-      -t|--simg2img : simg2img binary path to convert sparse images
+      -t|--simg2img : Path to simg2img binary for converting sparse images
+
+    INFO:
+      * fuse-ext2 available at 'https://github.com/alperakcan/fuse-ext2'
+      * Caller is responsible to unmount mount points when done
 _EOF
   abort 1
 }
@@ -40,10 +44,12 @@ command_exists() {
 extract_archive() {
   local IN_ARCHIVE="$1"
   local OUT_DIR="$2"
+  local archiveFile
 
   echo "[*] Extracting '$IN_ARCHIVE'"
 
-  local F_EXT="${IN_ARCHIVE#*.}"
+  archiveFile="$(basename "$IN_ARCHIVE")"
+  local F_EXT="${archiveFile#*.}"
   if [[ "$F_EXT" == "tar" || "$F_EXT" == "tar.gz" || "$F_EXT" == "tgz" ]]; then
     tar -xf "$IN_ARCHIVE" -C "$OUT_DIR" || { echo "[-] tar extract failed"; abort 1; }
   elif [[ "$F_EXT" == "zip" ]]; then
@@ -59,8 +65,12 @@ extract_vendor_partition_size() {
   local OUT_FILE="$2/vendor_partition_size"
   local size=""
 
-  size="$(LANG=C fdisk -l "$VENDOR_IMG_RAW" | egrep 'Disk.*bytes' | \
-          awk -F ', ' '{print $2}' | cut -d ' ' -f1)"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    size="$(stat -f %z "$VENDOR_IMG_RAW")"
+  else
+    size="$(du -b "$VENDOR_IMG_RAW" | tr '\t' ' ' | cut -d' ' -f1)"
+  fi
+
   if [[ "$size" == "" ]]; then
     echo "[!] Failed to extract vendor partition size from '$VENDOR_IMG_RAW'"
     abort 1
@@ -71,36 +81,24 @@ extract_vendor_partition_size() {
   echo "$size" > "$OUT_FILE"
 }
 
-mount_loop_and_copy() {
+mount_img() {
   local IMAGE_FILE="$1"
   local MOUNT_DIR="$2"
-  local COPY_DST_DIR="$3"
+  local MOUNT_LOG="$TMP_WORK_DIR/mount.log"
 
-  # Mount to loopback
-  mount -t ext4 -o ro,loop "$IMAGE_FILE" "$MOUNT_DIR" || {
-    echo "[-] '$IMAGE_FILE' mount to loopback failed"
-    if [[ "$OS" == "Darwin" ]]; then
-      echo "[!] Most probably your MAC doesn't support ext4"
-    fi
+  if [ ! -d "$MOUNT_DIR" ]; then
+    mkdir -p "$MOUNT_DIR"
+  fi
+
+  $_MOUNT -o uid=$EUID "$IMAGE_FILE" "$MOUNT_DIR" &>"$MOUNT_LOG" || {
+    echo "[-] '$IMAGE_FILE' mount failed"
+    cat "$MOUNT_LOG"
     abort 1
   }
 
-  # Copy files - it is very IMPORTANT that symbolic links are followed and copied
-  echo "[*] Copying files from '$(basename $IMAGE_FILE)' image ..."
-  rsync -aruz "$MOUNT_DIR/" "$COPY_DST_DIR" || {
-    echo "[-] rsync from '$MOUNT_DIR' to '$COPY_DST_DIR' failed"
-    abort 1
-  }
-
-  # Unmount
-  umount "$MOUNT_DIR" || {
-    echo "[-] '$MOUNT_DIR' umount failed"
-  }
-}
-
-run_as_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "[-] Script must run as root"
+  if ! mount | grep -qs "$MOUNT_DIR"; then
+    echo "[-] "$IMAGE_FILE" mount point missing indicates fuse mount error"
+    cat "$MOUNT_LOG"
     abort 1
   fi
 }
@@ -116,17 +114,26 @@ do
   fi
 done
 
-if [[ "$(uname)" == "Darwin" ]]; then
-  echo "[-] Darwin platform is not supported"
-  abort 1
-fi
-
-# Check if script run as root
-run_as_root
-
 INPUT_ARCHIVE=""
 OUTPUT_DIR=""
 SIMG2IMG=""
+_MOUNT=""
+
+# Compatibility
+HOST_OS=$(uname)
+if [[ "$HOST_OS" != "Linux" && "$HOST_OS" != "Darwin" ]]; then
+  echo "[-] '$HOST_OS' OS is not supported"
+  abort 1
+fi
+
+# Platform specific commands
+if [[ "$HOST_OS" == "Darwin" ]]; then
+  sysTools+=("mount")
+  _MOUNT="mount -t fuse-ext2"
+else
+  sysTools+=("fuse-ext2")
+  _MOUNT="fuse-ext2"
+fi
 
 while [[ $# -gt 1 ]]
 do
@@ -215,14 +222,10 @@ $SIMG2IMG "$vImg" "$rawVImg" || {
 # Save raw vendor img partition size
 extract_vendor_partition_size "$rawVImg" "$OUTPUT_DIR"
 
-# Mount raw system image to loopback and copy files
-sysImgData="$extractDir/factory.system"
-mkdir -p "$sysImgData"
-mount_loop_and_copy "$rawSysImg" "$sysImgData" "$SYSTEM_DATA_OUT"
+# Mount raw system image and copy files
+mount_img "$rawSysImg" "$SYSTEM_DATA_OUT"
 
 # Same process for vendor raw image
-vImgData="$extractDir/factory.vendor"
-mkdir -p "$vImgData"
-mount_loop_and_copy "$rawVImg" "$vImgData" "$VENDOR_DATA_OUT"
+mount_img "$rawVImg" "$VENDOR_DATA_OUT"
 
 abort 0
