@@ -126,8 +126,15 @@ If you want to contribute to device configuration files, please test against the
 target device before any pull request.
 
 ## Change Log
-* 0.1.5 - TBC
+* 0.1.6 - 4 Oct 2016
+ * Download automation compatibility with refactored Google Nexus images website
+ * Bug fixes when generating from MAC
+* 0.1.5 - 25 Sep 2016
  * Fixes issue with symlinks resolve when output path with spaces
+ * Fixes bug when repairing multi-dex APKs with oatdump method
+ * Introduced sorted data processing so that output is diff friendly
+ * Include baseband & bootloader firmware at vendor blobs
+ * Various performance optimizations
 * 0.1.4 - 17 Sep 2016
  * Split configuration into 2 groups: Naked & GPlay
  * Fix extra modules being ignored bug
@@ -158,7 +165,6 @@ to contribute if you detect that something is broken/missing or not required.
 * Host tool binaries are provided for convenience, although with no promises
 that will be kept up-to-date. Prefer to adjust your env. with upstream versions and
 keep them updated.
-* It's your responsibility to flash matching baseband & bootloader images.
 * If you experience `already defined` type of errors when AOSP makefiles are
 included, you have other vendor makefiles that define the same packages (e.g.
 hammerhead vs bullhead from LGE). This issue is due to the developers of
@@ -171,6 +177,9 @@ the bytecode de-optimization process to work.
 rules have `LOCAL_DEXPREOPT := false`. This is because host dex2oatd is invoked with
 more strict flags and results into aborting when front-end reaches already optimized
 instructions.
+* If you're planning to deliver OTA updates for Nexus 5x, you need to manually extract
+`update-binary` from a factory OTA archive since it's missing from AOSP tree due to some
+proprietary LG code.
 
 ## Frequently Spotted Issues
 ### fuse-ext2

@@ -31,9 +31,6 @@ readonly VGEN_SCRIPT="$SCRIPTS_ROOT/scripts/generate-vendor.sh"
 readonly LINUX_OATDUMP_BIN_URL='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21467&authkey=ADsdFhslWvJwuO8'
 readonly DARWIN_OATDUMP_BIN_URL='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21480&authkey=ANIztAhGhwGWDiU'
 
-# Change this if you don't want to apply used Java version system-wide
-readonly LC_J_HOME="/usr/local/java/jdk1.8.0_71/bin/java"
-
 declare -a sysTools=("mkdir" "dirname" "wget" "mount")
 declare -a availDevices=("bullhead" "flounder" "angler")
 
@@ -54,10 +51,12 @@ cat <<_EOF
       -a|--alias   : Device alias (e.g. flounder volantis (WiFi) vs volantisg (LTE))
       -b|--buildID : BuildID string (e.g. MMB29P)
       -o|--output  : Path to save generated vendor data
-      -i|--img     : [OPTIONAL] Read factory image archive from file instead of downloading
       -g|--gplay   : Use blobs configuration compatible with Google Play Services / GApps
+      -i|--img     : [OPTIONAL] Read factory image archive from file instead of downloading
       -k|--keep    : [OPTIONAL] Keep all factory images extracted & repaired data
       -s|--skip    : [OPTIONAL] Skip /system bytecode repairing (for debug purposes)
+      -j|--java    : [OPTIONAL] Java path to use instead of system auto detected global version
+      -y|--yes     : [OPTIONAL] Auto accept Google ToS when downloading Nexus factory images
 _EOF
   abort 1
 }
@@ -72,6 +71,7 @@ unmount_raw_image() {
   if [[ -d "$MOUNT_POINT" && -f "$MOUNT_POINT/build.prop" ]]; then
     $_UMOUNT "$MOUNT_POINT" || {
       echo "[-] '$MOUNT_POINT' unmount failed"
+      exit 1
     }
   fi
 }
@@ -112,6 +112,8 @@ SKIP_SYSDEOPT=false
 _UMOUNT=""
 FACTORY_IMGS_DATA=""
 CONFIG="config-naked"
+USER_JAVA_PATH=""
+AUTO_TOS_ACCEPT=false
 
 # Compatibility
 HOST_OS=$(uname)
@@ -137,30 +139,6 @@ do
     abort 1
   fi
 done
-
-# Resolve Java location
-readonly JAVALINK=$(which java)
-if [[ "$JAVALINK" == "" ]]; then
-  echo "[!] Java binary not found in path, using hardcoded path"
-  if [ ! -f "$LC_J_HOME" ]; then
-    echo "[-] '$LC_J_HOME' not found in system"
-    abort 1
-  fi
-
-  export JAVA_HOME=$LC_J_HOME
-  export PATH
-  PATH=$(dirname "$LC_J_HOME"):$PATH
-else
-  if [[ "$HOST_OS" == "Darwin" ]]; then
-    export JAVA_HOME="$(/usr/libexec/java_home)"
-    export PATH="$JAVA_HOME/bin":$PATH
-  else
-    readonly JAVAPATH=$(_realpath "$JAVALINK")
-    readonly JAVADIR=$(dirname "$JAVAPATH")
-    export JAVA_HOME="$JAVAPATH"
-    export PATH="$JAVADIR":$PATH
-  fi
-fi
 
 while [[ $# -gt 0 ]]
 do
@@ -195,6 +173,13 @@ do
     -s|--skip)
       SKIP_SYSDEOPT=true
       ;;
+    -j|--java)
+      USER_JAVA_PATH="$(_realpath "$2")"
+      shift
+      ;;
+    -y|--yes)
+      AUTO_TOS_ACCEPT=true
+      ;;
     *)
       echo "[-] Invalid argument '$1'"
       usage
@@ -218,6 +203,40 @@ fi
 if [[ "$INPUT_IMG" != "" && ! -f "$INPUT_IMG" ]]; then
   echo "[-] '$INPUT_IMG' file not found"
   abort 1
+fi
+if [[ "$USER_JAVA_PATH" != "" ]]; then
+  if  [ ! -f "$USER_JAVA_PATH" ]; then
+    echo "[-] '$USER_JAVA_PATH' path not found"
+    abort 1
+  fi
+  if [[ "$(basename "$USER_JAVA_PATH")" != "java" ]]; then
+    echo "[-] Invalid java path"
+    abort 1
+  fi
+fi
+
+# Resolve Java location
+if [[ "$USER_JAVA_PATH" != "" ]]; then
+  readonly JAVAPATH=$(_realpath "$USER_JAVA_PATH")
+  readonly JAVADIR=$(dirname "$JAVAPATH")
+  export JAVA_HOME="$JAVAPATH"
+  export PATH="$JAVADIR":$PATH
+else
+  readonly JAVALINK=$(which java)
+  if [[ "$JAVALINK" == "" ]]; then
+    # We don't fail since Java is required only when oat2dex method is used
+    echo "[-] Java not found in system"
+  else
+    if [[ "$HOST_OS" == "Darwin" ]]; then
+      export JAVA_HOME="$(/usr/libexec/java_home)"
+      export PATH="$JAVA_HOME/bin":$PATH
+    else
+      readonly JAVAPATH=$(_realpath "$JAVALINK")
+      readonly JAVADIR=$(dirname "$JAVAPATH")
+      export JAVA_HOME="$JAVAPATH"
+      export PATH="$JAVADIR":$PATH
+    fi
+  fi
 fi
 
 # Check if supported device
@@ -255,8 +274,13 @@ if [[ "$INPUT_IMG" == "" ]]; then
     DEV_ALIAS="$DEVICE"
   fi
 
+  __extraArgs=""
+  if [ $AUTO_TOS_ACCEPT = true ]; then
+    __extraArgs="--yes"
+  fi
+
  $DOWNLOAD_SCRIPT --device "$DEVICE" --alias "$DEV_ALIAS" \
-       --buildID "$BUILDID" --output "$OUT_BASE" || {
+       --buildID "$BUILDID" --output "$OUT_BASE" $__extraArgs || {
     echo "[-] Images download failed"
     abort 1
   }
@@ -360,6 +384,9 @@ ln -s "$FACTORY_IMGS_DATA/vendor" "$FACTORY_IMGS_R_DATA/vendor"
 # $VGEN_SCRIPT will fail over to last known working default if image size
 # file not found when parsing data
 cp "$FACTORY_IMGS_DATA/vendor_partition_size" "$FACTORY_IMGS_R_DATA"
+
+# Make radio files available to vendor generate script
+ln -s "$FACTORY_IMGS_DATA/radio" "$FACTORY_IMGS_R_DATA/radio"
 
 $VGEN_SCRIPT --input "$FACTORY_IMGS_R_DATA" --output "$OUT_BASE" \
   --blobs-list "$SCRIPTS_ROOT/$DEVICE/proprietary-blobs.txt" \

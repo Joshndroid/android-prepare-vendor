@@ -89,14 +89,6 @@ check_ram_size() {
   fi
 }
 
-print_expected_imgs_ver() {
-  bootloader=$(grep 'ro.build.expect.bootloader' "$1" | cut -d '=' -f2)
-  baseband=$(grep 'ro.build.expect.baseband' "$1" | cut -d '=' -f2)
-  echo "[!] Target device expects to have following img versions when using output system img"
-  echo " [*] Booatloder:$bootloader"
-  echo " [*] Baseband:$baseband"
-}
-
 get_build_id() {
   local build_id
 
@@ -212,11 +204,11 @@ oat2dex_repair() {
     if [ $odexFound -eq 0 ]; then
       # shellcheck disable=SC2015
       zipinfo "$file" classes.dex &>/dev/null && {
-        echo "[*] '$relFile' not pre-optimized with sanity checks passed - copying without changes"
-        cp -a "$file" "$OUTPUT_SYS/$relDir"
+        echo "[!] '$relFile' not pre-optimized with sanity checks passed - copying without changes"
       } || {
-        echo "[-] '$relFile' not pre-optimized & without 'classes.dex' - skipping"
+        echo "[!] '$relFile' not pre-optimized & without 'classes.dex' - copying without changes"
       }
+      cp -a "$file" "$OUTPUT_SYS/$relDir"
     else
       # If pre-compiled, de-optimize to original DEX bytecode
       for abi in ${ABIS[@]}
@@ -288,10 +280,9 @@ oat2dex_repair() {
         zip -d "$TMP_WORK_DIR/$fileName" META-INF/\* &>/dev/null
       fi
 
-      mkdir -p "$OUTPUT_SYS/$relDir"
       cp "$TMP_WORK_DIR/$fileName" "$OUTPUT_SYS/$relDir"
     fi
-  done <<< "$(find "$INPUT_DIR" -not -type d)"
+  done < <(find "$INPUT_DIR" -not -type d)
 }
 
 oatdump_repair() {
@@ -317,7 +308,7 @@ oatdump_repair() {
   do
     jarFile="$(basename "$file" | cut -d '-' -f2- | sed 's#.oat#.jar#')"
     BOOTJARS=("${BOOTJARS[@]-}" "$jarFile")
-  done <<< "$(find "$INPUT_DIR/framework/${ABIS[1]}" -iname "boot-*.oat")"
+  done < <(find "$INPUT_DIR/framework/${ABIS[1]}" -iname "boot-*.oat")
 
   while read -r file
   do
@@ -368,11 +359,11 @@ oatdump_repair() {
     if [ $odexFound -eq 0 ]; then
       # shellcheck disable=SC2015
       zipinfo "$file" classes.dex &>/dev/null && {
-        echo "[*] '$relFile' not pre-optimized with sanity checks passed - copying without changes"
-        cp -a "$file" "$OUTPUT_SYS/$relDir"
+        echo "[!] '$relFile' not pre-optimized with sanity checks passed - copying without changes"
       } || {
-        echo "[-] '$relFile' not pre-optimized & without 'classes.dex' - skipping"
+        echo "[!] '$relFile' not pre-optimized & without 'classes.dex' - copying without changes"
       }
+      cp -a "$file" "$OUTPUT_SYS/$relDir"
     else
       # If pre-compiled, dump bytecode from oat .rodata section
       # If bytecode compiled for more than one ABIs - only the first is kept
@@ -413,7 +404,8 @@ oatdump_repair() {
         # multi-dex file
         echo "[*] '$relFile' is multi-dex - adjusting recursive archive adds"
         counter=2
-        curMultiDex="$(find "$TMP_WORK_DIR" -type f -maxdepth 1 "*$counter*_repaired.dex")"
+        curMultiDex="$(find "$TMP_WORK_DIR" -type f -maxdepth 1 \
+                       -name "*classes$counter.dex*_repaired.dex")"
         while [ "$curMultiDex" != "" ]
         do
           mv "$curMultiDex" "$TMP_WORK_DIR/classes$counter.dex"
@@ -425,7 +417,8 @@ oatdump_repair() {
           rm "$TMP_WORK_DIR/classes$counter.dex"
 
           counter=$(( counter + 1))
-          curMultiDex="$(find "$TMP_WORK_DIR" -type f -maxdepth 1 "*$counter*_repaired.dex")"
+          curMultiDex="$(find "$TMP_WORK_DIR" -type f -maxdepth 1 \
+                         -name "*classes$counter.dex*_repaired.dex")"
         done
       fi
 
@@ -443,10 +436,9 @@ oatdump_repair() {
         zip -d "$TMP_WORK_DIR/$fileName" META-INF/\* &>/dev/null
       fi
 
-      mkdir -p "$OUTPUT_SYS/$relDir"
       mv "$TMP_WORK_DIR/$fileName" "$OUTPUT_SYS/$relDir"
     fi
-  done <<< "$(find "$INPUT_DIR" -not -type d)"
+  done < <(find "$INPUT_DIR" -not -type d)
 }
 
 trap "abort 1" SIGINT SIGTERM
@@ -611,6 +603,5 @@ elif [[ "$REPAIR_METHOD" == "OATDUMP" ]]; then
 fi
 
 echo "[*] System partition successfully extracted & repaired at '$OUTPUT_DIR'"
-print_expected_imgs_ver "$INPUT_DIR/build.prop"
 
 abort 0
