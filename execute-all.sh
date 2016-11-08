@@ -27,9 +27,11 @@ readonly REPAIR_SCRIPT="$SCRIPTS_ROOT/scripts/system-img-repair.sh"
 # Helper script to generate vendor AOSP includes & makefiles
 readonly VGEN_SCRIPT="$SCRIPTS_ROOT/scripts/generate-vendor.sh"
 
-# oatdump dependencies
-readonly LINUX_OATDUMP_BIN_URL='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21467&authkey=ADsdFhslWvJwuO8'
-readonly DARWIN_OATDUMP_BIN_URL='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21480&authkey=ANIztAhGhwGWDiU'
+# oatdump dependencies URLs
+readonly L_OATDUMP_URL_API23='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21490&authkey=ACA4f4Zvs3Tb_SY'
+readonly D_OATDUMP_URL_API23='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21493&authkey=AJ0rWu5Ci8tQNLY'
+readonly L_OATDUMP_URL_API24='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21492&authkey=AE4uqwH-THvvkSQ'
+readonly D_OATDUMP_URL_API24='https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21491&authkey=AHvCaYwFBPYD4Fs'
 
 declare -a sysTools=("mkdir" "dirname" "wget" "mount")
 declare -a availDevices=("bullhead" "flounder" "angler")
@@ -57,12 +59,29 @@ cat <<_EOF
       -s|--skip    : [OPTIONAL] Skip /system bytecode repairing (for debug purposes)
       -j|--java    : [OPTIONAL] Java path to use instead of system auto detected global version
       -y|--yes     : [OPTIONAL] Auto accept Google ToS when downloading Nexus factory images
+      --force-opt  : [OPTIONAL] Disable LOCAL_DEX_PREOPT overrides for /system bytecode
+      --oatdump    : [OPTIONAL] Force use of oatdump method to revert preoptimized bytecode
+      --smali      : [OPTIONAL] Force use of smali/baksmali to revert preoptimized bytecode
+      --smaliex    : [OPTIONAL] Force use of smaliEx to revert preoptimized bytecode [DEPRECATED]
+      --deodex-all : [OPTIONAL] De-optimize all packages under /system
+
+    INFO:
+      * Default configuration is naked. Use "-g|--gplay" if you plan to install Google Play Services.
+      * Default bytecode de-optimization repair choise is based on most stable/heavily-tested method
+        If you need something on the top of defaults, you can select manually.
 _EOF
   abort 1
 }
 
 command_exists() {
   type "$1" &> /dev/null
+}
+
+check_bash_version() {
+  if [ ${BASH_VERSINFO[0]} -lt 4 ]; then
+    echo "[-] Minimum supported version of bash is 4.x"
+    abort 1
+  fi
 }
 
 unmount_raw_image() {
@@ -77,20 +96,25 @@ unmount_raw_image() {
 }
 
 oatdump_prepare_env() {
-  local OUT_FILE="$SCRIPTS_ROOT/hostTools/$HOST_OS/oatdump_deps.zip"
+  local API_LEVEL="$1"
+
   local DOWNLOAD_URL
+  local OUT_FILE="$SCRIPTS_ROOT/hostTools/$HOST_OS/api-$API_LEVEL/oatdump_deps.zip"
+  mkdir -p "$(dirname "$OUT_FILE")"
+
+
   if [[ "$HOST_OS" == "Darwin" ]]; then
-    DOWNLOAD_URL="$DARWIN_OATDUMP_BIN_URL"
+    DOWNLOAD_URL="D_OATDUMP_URL_API$API_LEVEL"
   else
-    DOWNLOAD_URL="$LINUX_OATDUMP_BIN_URL"
+    DOWNLOAD_URL="L_OATDUMP_URL_API$API_LEVEL"
   fi
 
-  wget -O "$OUT_FILE" "$DOWNLOAD_URL" || {
+  wget -O "$OUT_FILE" "${!DOWNLOAD_URL}" || {
     echo "[-] oatdump dependencies download failed"
     abort 1
   }
 
-  unzip -qq "$OUT_FILE" -d "$SCRIPTS_ROOT/hostTools/$HOST_OS" || {
+  unzip -qq "$OUT_FILE" -d "$SCRIPTS_ROOT/hostTools/$HOST_OS/api-$API_LEVEL" || {
     echo "[-] oatdump dependencies unzip failed"
     abort 1
   }
@@ -114,8 +138,15 @@ FACTORY_IMGS_DATA=""
 CONFIG="config-naked"
 USER_JAVA_PATH=""
 AUTO_TOS_ACCEPT=false
+FORCE_PREOPT=false
+FORCE_SMALI=false
+FORCE_OATDUMP=false
+FORCE_SMALIEX=false
+BYTECODE_REPAIR_METHOD=""
+DEODEX_ALL=false
 
 # Compatibility
+check_bash_version
 HOST_OS=$(uname)
 if [[ "$HOST_OS" != "Linux" && "$HOST_OS" != "Darwin" ]]; then
   echo "[-] '$HOST_OS' OS is not supported"
@@ -180,6 +211,21 @@ do
     -y|--yes)
       AUTO_TOS_ACCEPT=true
       ;;
+    --force-opt)
+      FORCE_PREOPT=true
+      ;;
+    --smali)
+      FORCE_SMALI=true
+      ;;
+    --smaliex)
+      FORCE_SMALIEX=true
+      ;;
+    --oatdump)
+      FORCE_OATDUMP=true
+      ;;
+    --deodex-all)
+      DEODEX_ALL=true
+      ;;
     *)
       echo "[-] Invalid argument '$1'"
       usage
@@ -188,6 +234,7 @@ do
   shift
 done
 
+# Check user input args
 if [[ "$DEVICE" == "" ]]; then
   echo "[-] device codename cannot be empty"
   usage
@@ -215,29 +262,39 @@ if [[ "$USER_JAVA_PATH" != "" ]]; then
   fi
 fi
 
+# Some business logic related checks
+if [[ $DEODEX_ALL = true && $KEEP_DATA = false ]]; then
+  echo "[!] It's pointless to deodex all if not keeping runtime generated data"
+  echo "    After vendor generate finishes all files not part of configs will be deleted"
+  abort 1
+fi
+
 # Resolve Java location
+__JAVAPATH=""
+__JAVADIR=""
+__JAVA_HOME=""
 if [[ "$USER_JAVA_PATH" != "" ]]; then
-  readonly JAVAPATH=$(_realpath "$USER_JAVA_PATH")
-  readonly JAVADIR=$(dirname "$JAVAPATH")
-  export JAVA_HOME="$JAVAPATH"
-  export PATH="$JAVADIR":$PATH
+  __JAVAPATH=$(_realpath "$USER_JAVA_PATH")
+  __JAVADIR=$(dirname "$__JAVAPATH")
+  __JAVA_HOME="$__JAVAPATH"
 else
-  readonly JAVALINK=$(which java)
-  if [[ "$JAVALINK" == "" ]]; then
+  readonly __JAVALINK=$(which java)
+  if [[ "$__JAVALINK" == "" ]]; then
     # We don't fail since Java is required only when oat2dex method is used
     echo "[-] Java not found in system"
   else
     if [[ "$HOST_OS" == "Darwin" ]]; then
-      export JAVA_HOME="$(/usr/libexec/java_home)"
-      export PATH="$JAVA_HOME/bin":$PATH
+      __JAVA_HOME="$(/usr/libexec/java_home)"
+      __JAVADIR="$__JAVA_HOME/bin"
     else
-      readonly JAVAPATH=$(_realpath "$JAVALINK")
-      readonly JAVADIR=$(dirname "$JAVAPATH")
-      export JAVA_HOME="$JAVAPATH"
-      export PATH="$JAVADIR":$PATH
+      __JAVAPATH=$(_realpath "$__JAVALINK")
+      __JAVADIR=$(dirname "$__JAVAPATH")
+      __JAVA_HOME="$__JAVAPATH"
     fi
   fi
 fi
+export JAVA_HOME="$__JAVA_HOME"
+export PATH="$__JAVADIR":$PATH
 
 # Check if supported device
 deviceOK=false
@@ -298,6 +355,9 @@ fi
 # Define API level from first char of build tag
 magicChar=$(echo "${BUILDID:0:1}" | tr '[:upper:]' '[:lower:]')
 case "$magicChar" in
+  "l")
+    API_LEVEL=22
+    ;;
   "m")
     API_LEVEL=23
     ;;
@@ -348,29 +408,81 @@ else
   mkdir -p "$FACTORY_IMGS_R_DATA"
 fi
 
-# Adjust repair method based on API level or skip flag
+# Set bytecode repair method based on user arguments
 if [ $SKIP_SYSDEOPT = true ]; then
-  REPAIR_SCRIPT_ARG="--method NONE"
-elif [ $API_LEVEL -le 23 ]; then
-  REPAIR_SCRIPT_ARG="--method OAT2DEX \
-                     --oat2dex $SCRIPTS_ROOT/hostTools/Java/oat2dex.jar"
-elif [ $API_LEVEL -ge 24 ]; then
-  if [ ! -f "$SCRIPTS_ROOT/hostTools/$HOST_OS/bin/oatdump" ]; then
-    echo "[*] First run detected - downloading oatdump host bin & lib dependencies"
-    oatdump_prepare_env
-  fi
-  REPAIR_SCRIPT_ARG="--method OATDUMP \
-                     --oatdump $SCRIPTS_ROOT/hostTools/$HOST_OS/bin/oatdump \
-                     --dexrepair $SCRIPTS_ROOT/hostTools/$HOST_OS/bin/dexrepair"
+  BYTECODE_REPAIR_METHOD="NONE"
+elif [ $FORCE_SMALI = true ]; then
+  BYTECODE_REPAIR_METHOD="SMALIDEODEX"
+elif [ $FORCE_SMALIEX = true ]; then
+  BYTECODE_REPAIR_METHOD="OAT2DEX"
+elif [ $FORCE_OATDUMP = true ]; then
+  BYTECODE_REPAIR_METHOD="OATDUMP"
 else
-  echo "[-] Non expected /system repair method"
+  # Default choices based on API level
+  if [ $API_LEVEL -le 23 ]; then
+    BYTECODE_REPAIR_METHOD="OAT2DEX"
+  elif [ $API_LEVEL -ge 24 ]; then
+    BYTECODE_REPAIR_METHOD="OATDUMP"
+  fi
+fi
+
+# OAT2DEX method is based on SmaliEx which is deprecated
+if [[ "$BYTECODE_REPAIR_METHOD" == "OAT2DEX" && $API_LEVEL -ge 24 ]]; then
+  echo "[-] SmaliEx OAT2DEX bytecode repair method is deprecated & not supporting API >= 24"
   abort 1
 fi
 
-$REPAIR_SCRIPT --input "$FACTORY_IMGS_DATA/system" \
-     --output "$FACTORY_IMGS_R_DATA" \
-     --bytecode-list "$SCRIPTS_ROOT/$DEVICE/$CONFIG/bytecode-proprietary-api$API_LEVEL.txt" \
-     $REPAIR_SCRIPT_ARG || {
+# Adjust arguments of system repair script based on chosen method
+case $BYTECODE_REPAIR_METHOD in
+  "NONE")
+    REPAIR_SCRIPT_ARG=""
+    ;;
+  "OATDUMP")
+    if [ ! -f "$SCRIPTS_ROOT/hostTools/$HOST_OS/api-$API_LEVEL/bin/oatdump" ]; then
+      echo "[*] First run detected - downloading oatdump host bin & lib dependencies"
+      oatdump_prepare_env "$API_LEVEL"
+    fi
+    REPAIR_SCRIPT_ARG="--oatdump $SCRIPTS_ROOT/hostTools/$HOST_OS/api-$API_LEVEL/bin/oatdump \
+                       --dexrepair $SCRIPTS_ROOT/hostTools/$HOST_OS/bin/dexrepair"
+
+    # dex2oat is invoked from host with aggressive verifier flags. So there is a
+    # high chance it will fail to preoptimize bytecode repaired with oatdump method.
+    # Let the user know.
+    if [ $FORCE_PREOPT = true ]; then
+      echo "[!] AOSP builds might fail when LOCAL_DEX_PREOPT isn't false when using OATDUMP bytecode repair method"
+    fi
+    ;;
+  "OAT2DEX")
+    REPAIR_SCRIPT_ARG="--oat2dex $SCRIPTS_ROOT/hostTools/Java/oat2dex.jar"
+
+    # LOCAL_DEX_PREOPT can be safely used so enable globally for /system
+    FORCE_PREOPT=true
+    ;;
+  "SMALIDEODEX")
+    if [ ! -f "$SCRIPTS_ROOT/hostTools/$HOST_OS/api-$API_LEVEL/bin/oatdump" ]; then
+      echo "[*] First run detected - downloading oatdump host bin & lib dependencies"
+      oatdump_prepare_env "$API_LEVEL"
+    fi
+    REPAIR_SCRIPT_ARG="--oatdump $SCRIPTS_ROOT/hostTools/$HOST_OS/api-$API_LEVEL/bin/oatdump \
+                       --smali $SCRIPTS_ROOT/hostTools/Java/smali.jar \
+                       --baksmali $SCRIPTS_ROOT/hostTools/Java/baksmali.jar"
+
+    # LOCAL_DEX_PREOPT can be safely used so enable globally for /system
+    FORCE_PREOPT=true
+    ;;
+  *)
+    echo "[-] Invalid bytecode repair method"
+    abort 1
+    ;;
+esac
+
+# If deodex all not set provide a list of packages to repair
+if [ $DEODEX_ALL = false ]; then
+  REPAIR_SCRIPT_ARG+=" --bytecode-list $SCRIPTS_ROOT/$DEVICE/$CONFIG/bytecode-proprietary-api$API_LEVEL.txt"
+fi
+
+$REPAIR_SCRIPT --method "$BYTECODE_REPAIR_METHOD" --input "$FACTORY_IMGS_DATA/system" \
+     --output "$FACTORY_IMGS_R_DATA" $REPAIR_SCRIPT_ARG || {
   echo "[-] System partition bytecode repair failed"
   abort 1
 }
@@ -388,11 +500,17 @@ cp "$FACTORY_IMGS_DATA/vendor_partition_size" "$FACTORY_IMGS_R_DATA"
 # Make radio files available to vendor generate script
 ln -s "$FACTORY_IMGS_DATA/radio" "$FACTORY_IMGS_R_DATA/radio"
 
+VGEN_SCRIPT_EXTRA_ARGS=""
+if [ $FORCE_PREOPT = true ]; then
+  VGEN_SCRIPT_EXTRA_ARGS="--allow-preopt"
+fi
+
 $VGEN_SCRIPT --input "$FACTORY_IMGS_R_DATA" --output "$OUT_BASE" \
   --blobs-list "$SCRIPTS_ROOT/$DEVICE/proprietary-blobs.txt" \
   --dep-dso-list "$SCRIPTS_ROOT/$DEVICE/$CONFIG/dep-dso-proprietary-blobs-api$API_LEVEL.txt" \
   --flags-list "$SCRIPTS_ROOT/$DEVICE/$CONFIG/vendor-config-api$API_LEVEL.txt" \
-  --extra-modules "$SCRIPTS_ROOT/$DEVICE/$CONFIG/extra-modules-api$API_LEVEL.txt" || {
+  --extra-modules "$SCRIPTS_ROOT/$DEVICE/$CONFIG/extra-modules-api$API_LEVEL.txt" \
+  $VGEN_SCRIPT_EXTRA_ARGS || {
   echo "[-] Vendor generation failed"
   abort 1
 }

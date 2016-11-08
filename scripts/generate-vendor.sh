@@ -54,6 +54,7 @@ cat <<_EOF
                         'BoardConfigVendor.mk'
       --extra-modules : Text file additional modules to be appended at master vendor
                         'Android.mk'
+      --allow-preopt  : Don't disable LOCAL_DEX_PREOPT for /system
     INFO:
       * Output should be moved/synced with AOSP root, unless -o is AOSP root
 _EOF
@@ -203,15 +204,26 @@ extract_blobs() {
     if [ ! -d "$outBase/$dstDir" ]; then
       mkdir -p "$outBase/$dstDir"
     fi
-    cp "$INDIR/$src" "$outBase/$dst"
+    cp "$INDIR/$src" "$outBase/$dst" || {
+      echo "[-] Failed to copy '$src'"
+      abort 1
+    }
 
     # Some vendor xml files don't satisfy xmllint so fix here
     if [[ "${file##*.}" == "xml" ]]; then
-      openTag=$(grep '^<?xml version' "$outBase/$dst")
-      grep -v '^<?xml version' "$outBase/$dst" > "$TMP_WORK_DIR/xml_fixup.tmp"
-      echo "$openTag" > "$outBase/$dst"
-      cat "$TMP_WORK_DIR/xml_fixup.tmp" >> "$outBase/$dst"
-      rm "$TMP_WORK_DIR/xml_fixup.tmp"
+      openTag=""
+      openTag=$(grep '^<?xml version' "$outBase/$dst" || true )
+      if [[ "$openTag" == "" ]]; then
+        cp "$INDIR/$src" "$outBase/$dst" || {
+          echo "[-] Failed to copy '$src'"
+          abort 1
+        }
+      else
+        grep -v '^<?xml version' "$outBase/$dst" > "$TMP_WORK_DIR/xml_fixup.tmp"
+        echo "$openTag" > "$outBase/$dst"
+        cat "$TMP_WORK_DIR/xml_fixup.tmp" >> "$outBase/$dst"
+        rm "$TMP_WORK_DIR/xml_fixup.tmp"
+      fi
     fi
   done < <(grep -Ev '(^#|^$)' "$BLOBS_LIST")
 }
@@ -570,7 +582,18 @@ gen_mk_for_bytecode() {
         echo "$priv"
       fi
       echo "LOCAL_MODULE_SUFFIX := $suffix"
-      echo "LOCAL_DEX_PREOPT := false"
+      if [[ "$ALLOW_PREOPT" = false || "$RELROOT" == "vendor" ]]; then
+        echo "LOCAL_DEX_PREOPT := false"
+      fi
+
+      # Deal with multi-lib
+      if [[ ( -d "$appDir/oat/arm" && -d "$appDir/oat/arm64" ) ||
+            ( -d "$appDir/oat/x86" && -d "$appDir/oat/x86_64" ) ]]; then
+        echo "LOCAL_MULTILIB := both"
+      elif [[ -d "$appDir/oat/arm" || -d "$appDir/oat/x86" ]]; then
+        echo "LOCAL_MULTILIB := 32"
+      fi
+
       echo 'include $(BUILD_PREBUILT)'
 
       # Append rules for APK lib symlinks if present
@@ -747,10 +770,20 @@ gen_mk_for_shared_libs() {
 }
 
 gen_android_mk() {
-  local root path
+  local root path targetProductDevice
+  targetProductDevice="$DEVICE"
   {
     echo 'LOCAL_PATH := $(call my-dir)'
-    echo "ifeq (\$(TARGET_DEVICE),$DEVICE)"
+
+    # Special handling for flounder dual target boards
+    if [[ "$DEVICE" == "flounder_lte" ]]; then
+      echo 'ifneq ("$(wildcard vendor/htc/flounder/Android.mk)","")'
+      echo '  $(error "volantis & volantisg vendor blobs cannot co-exist under AOSP root since definitions conflict")'
+      echo 'endif'
+      targetProductDevice="flounder"
+    fi
+
+    echo "ifeq (\$(TARGET_DEVICE),$targetProductDevice)"
     echo ""
     echo "include vendor/$VENDOR/$DEVICE/AndroidBoardVendor.mk"
   } >> "$ANDROID_MK"
@@ -810,6 +843,26 @@ gen_sigs_file() {
   done
 }
 
+check_dir() {
+  local dirPath="$1"
+  local dirDesc="$2"
+
+  if [[ "$dirPath" == "" || ! -d "$dirPath" ]]; then
+    echo "[-] $dirDesc directory not found"
+    usage
+  fi
+}
+
+check_file() {
+  local filePath="$1"
+  local fileDesc="$2"
+
+  if [[ "$filePath" == "" || ! -f "$filePath" ]]; then
+    echo "[-] $fileDesc file not found"
+    usage
+  fi
+}
+
 trap "abort 1" SIGINT SIGTERM
 . "$REALPATH_SCRIPT"
 
@@ -819,6 +872,7 @@ BLOBS_LIST=""
 DEP_DSO_BLOBS_LIST=""
 MK_FLAGS_LIST=""
 EXTRA_MODULES=""
+ALLOW_PREOPT=false
 
 DEVICE=""
 VENDOR=""
@@ -833,7 +887,7 @@ do
   fi
 done
 
-while [[ $# -gt 1 ]]
+while [[ $# -gt 0 ]]
 do
   arg="$1"
   case $arg in
@@ -861,6 +915,9 @@ do
       EXTRA_MODULES="$2"
       shift
       ;;
+    --allow-preopt)
+      ALLOW_PREOPT=true
+      ;;
     *)
       echo "[-] Invalid argument '$1'"
       usage
@@ -869,30 +926,15 @@ do
   shift
 done
 
-if [[ "$INPUT_DIR" == "" || ! -d "$INPUT_DIR" ]]; then
-  echo "[-] Input directory not found"
-  usage
-fi
-if [[ "$OUTPUT_DIR" == "" || ! -d "$OUTPUT_DIR" ]]; then
-  echo "[-] Output directory not found"
-  usage
-fi
-if [[ "$BLOBS_LIST" == "" || ! -f "$BLOBS_LIST" ]]; then
-  echo "[-] Vendor proprietary-blobs file not found"
-  usage
-fi
-if [[ "$DEP_DSO_BLOBS_LIST" == "" || ! -f "$DEP_DSO_BLOBS_LIST" ]]; then
-  echo "[-] Vendor dep-dso-proprietary file not found"
-  usage
-fi
-if [[ "$MK_FLAGS_LIST" == "" || ! -f "$MK_FLAGS_LIST" ]]; then
-  echo "[-] Vendor vendor-config file not found"
-  usage
-fi
-if [[ "$EXTRA_MODULES" == "" || ! -f "$EXTRA_MODULES" ]]; then
-  echo "[-] Vendor extra modules file not found"
-  usage
-fi
+# Input args check
+check_dir "$INPUT_DIR" "Input"
+check_dir "$OUTPUT_DIR" "Output"
+
+# Mandatory configuration files
+check_file "$BLOBS_LIST" "Vendor proprietary-blobs"
+check_file "$DEP_DSO_BLOBS_LIST" "Vendor dep-dso-proprietary"
+check_file "$MK_FLAGS_LIST" "Vendor vendor-config"
+check_file "$EXTRA_MODULES" "Vendor extra modules"
 
 # Verify input directory structure
 verify_input "$INPUT_DIR"

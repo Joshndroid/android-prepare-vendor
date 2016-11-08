@@ -51,8 +51,10 @@ cat <<_EOF
       -o|--output     : Path to save input partition with repaired bytecode
       -m|--method     : Repair methods ('NONE', 'OAT2DEX', 'OATDUMP')
       --oat2dex       : [OPTIONAL] Path to SmaliEx oat2dex.jar (when 'OAT2DEX' method)
-      --oatdump       : [OPTIONAL] Path to ART oatdump executable (when 'OATDUMP' method)
+      --oatdump       : [OPTIONAL] Path to ART oatdump executable (when 'OATDUMP' or 'SMALIDEODEX' method)
       --dexrepair     : [OPTIONAL] Path to dexrepair executable (when 'OATDUMP' method)
+      --smali         : [OPTIONAL] Path to smali.har (when 'SMALIDEODEX' method)
+      --baksmali      : [OPTIONAL] Path to baksmali.har (when 'SMALIDEODEX' method)
       --bytecode-list : [OPTIONAL] list with bytecode archive files to be included in
                         generated MKs. When provided only required bytecode is repaired,
                         otherwise all bytecode in partition is repaired.
@@ -61,6 +63,7 @@ cat <<_EOF
       * Download oat2dex.jar from 'https://github.com/testwhat/SmaliEx'
       * Download dexrepair from 'https://github.com/anestisb/dexRepair'
       * Compile oatdump host tools from AOSP /art repo
+      * Download baksmali from 'https://github.com/JesusFreke/smali'
       * When creating vendor makefiles, extra care is needed for APKs signature type
       * '--bytecode-list' flag is provided to speed up things in case only specific files are wanted
 _EOF
@@ -71,7 +74,7 @@ command_exists() {
   type "$1" &> /dev/null
 }
 
-# Print RAM size memory warning when using oat2dex.jar tool
+# Print RAM size memory warning when using smali jar tools
 check_ram_size() {
   local HOST_OS
   local RAM_SIZE
@@ -85,7 +88,7 @@ check_ram_size() {
   fi
 
   if [ $RAM_SIZE -le 2 ]; then
-    echo "[!] Host RAM size <= 2GB - oat2jex.jar might crash due to low memory"
+    echo "[!] Host RAM size <= 2GB - jars might crash due to low memory"
   fi
 }
 
@@ -211,22 +214,35 @@ oat2dex_repair() {
       cp -a "$file" "$OUTPUT_SYS/$relDir"
     else
       # If pre-compiled, de-optimize to original DEX bytecode
+      deoptSuccess=false
       for abi in ${ABIS[@]}
       do
         curOdex="$zipRoot/oat/$abi/$pkgName.odex"
         if [ -f "$curOdex" ]; then
+          # If we already have bytecode de-optimized for one ABI don't redo the work
+          # just create the dir annotation to pickup multi-lib both scenarios
+          if [ $deoptSuccess = true ]; then
+            mkdir -p "$OUTPUT_SYS/$relDir/oat/$abi"
+            continue
+          fi
+
           # If odex present de-optimize it
           java -jar "$OAT2DEX_JAR" -o "$TMP_WORK_DIR" "$curOdex" \
                "$TMP_WORK_DIR/$abi/dex" &>/dev/null || {
-            echo "[!] '$relFile/oat/$abi/$pkgName.odex' de-optimization failed"
+            echo "[-] '$relFile/oat/$abi/$pkgName.odex' de-optimization failed"
             abort 1
           }
 
           # If DEX not created, oat2dex failed to resolve a dependency and skipped file
           if [ ! -f "$TMP_WORK_DIR/$pkgName.dex" ]; then
-            echo "[-] '$relFile' de-optimization failed consider manual inspection - skipping archive"
-            continue 2
+            echo "[-] '$relFile' de-optimization failed"
+            abort 1
           fi
+
+          # Generate an empty directory under package dir with the detected ABI
+          # so that vendor generate script can detect possible multilib scenarios
+          mkdir -p "$OUTPUT_SYS/$relDir/oat/$abi"
+          deoptSuccess=true
         elif [ -f "$TMP_WORK_DIR/$abi/dex/$pkgName.dex" ]; then
           # boot classes bytecode is available from boot.oat extracts - copy
           # them with wildcard so following multi-dex detection logic can pick
@@ -308,7 +324,7 @@ oatdump_repair() {
   do
     jarFile="$(basename "$file" | cut -d '-' -f2- | sed 's#.oat#.jar#')"
     BOOTJARS=("${BOOTJARS[@]-}" "$jarFile")
-  done < <(find "$INPUT_DIR/framework/${ABIS[1]}" -iname "boot-*.oat")
+  done < <(find "$INPUT_DIR/framework/${ABIS[1]}" -iname "boot*.oat")
 
   while read -r file
   do
@@ -368,25 +384,37 @@ oatdump_repair() {
       # If pre-compiled, dump bytecode from oat .rodata section
       # If bytecode compiled for more than one ABIs - only the first is kept
       # (shouldn't make any difference)
+      deoptSuccess=false
       for abi in ${ABIS[@]}
       do
         curOdex="$zipRoot/oat/$abi/$pkgName.odex"
-        if [ -f "$curOdex" ]; then
-          $OATDUMP_BIN --oat-file="$curOdex" \
-               --export-dex-to="$TMP_WORK_DIR" &>/dev/null || {
-            echo "[!] DEX dump from '$curOdex' failed"
-            abort 1
-          }
+        if [ ! -f "$curOdex" ]; then
+          continue
+        fi
 
-          # If DEX not created, oat2dex failed to resolve a dependency and skipped file
-          dexsExported=$(find "$TMP_WORK_DIR" -maxdepth 1 -type f -name "*_export.dex" | wc -l | tr -d ' ')
-          if [ $dexsExported -eq 0 ]; then
-            echo "[-] '$relFile' DEX export failed consider manual inspection - skipping archive"
-            continue 2
-          else
-            # Abort inner loop on first match
-            continue
-          fi
+        # If we already have bytecode de-optimized for one ABI don't redo the work
+        # just create the dir annotation to pickup multi-lib both scenarios
+        if [ $deoptSuccess = true ]; then
+          mkdir -p "$OUTPUT_SYS/$relDir/oat/$abi"
+          continue
+        fi
+
+        $OATDUMP_BIN --oat-file="$curOdex" \
+             --export-dex-to="$TMP_WORK_DIR" &>/dev/null || {
+          echo "[-] DEX dump from '$curOdex' failed"
+          abort 1
+        }
+
+        # If DEX not created, oat2dex failed to resolve a dependency and skipped file
+        dexsExported=$(find "$TMP_WORK_DIR" -maxdepth 1 -type f -name "*_export.dex" | wc -l | tr -d ' ')
+        if [ $dexsExported -eq 0 ]; then
+          echo "[-] '$relFile' DEX export failed"
+          abort 1
+        else
+          # Generate an empty directory under package dir with the detected ABI
+          # so that vendor generate script can detect possible multilib scenarios
+          mkdir -p "$OUTPUT_SYS/$relDir/oat/$abi"
+          deoptSuccess=true
         fi
       done
 
@@ -441,6 +469,192 @@ oatdump_repair() {
   done < <(find "$INPUT_DIR" -not -type d)
 }
 
+smali_repair() {
+  local -a ABIS
+
+  check_ram_size
+
+  # Identify supported ABI(s) - extra work for 64bit ABIs
+  for type in "arm" "arm64" "x86" "x86_64"
+  do
+    if [ -f "$INPUT_DIR/framework/$type/boot.art" ]; then
+      ABIS=("${ABIS[@]-}" "$type")
+    fi
+  done
+
+  for abi in ${ABIS[@]}
+  do
+    echo "[*] Preparing environment for '$abi' ABI"
+    workDir="$TMP_WORK_DIR/$abi"
+    mkdir -p "$workDir"
+    cp "$INPUT_DIR/framework/$abi/"boot*.oat "$workDir"
+  done
+
+  echo "[*] Start processing system partition & de-optimize pre-compiled bytecode"
+
+  while read -r file
+  do
+    relFile=$(echo "$file" | sed "s#^$INPUT_DIR##")
+    relDir=$(dirname "$relFile")
+    fileExt="${file##*.}"
+    fileName=$(basename "$relFile")
+
+    # Skip special files
+    if [[ "$fileExt" == "odex" || "$fileExt" == "oat" || "$fileExt" == "art" ]]; then
+      continue
+    fi
+
+    # Maintain dir structure
+    mkdir -p "$OUTPUT_SYS/$relDir"
+
+    # If not APK/jar file, copy as is
+    if [[ "$fileExt" != "apk" && "$fileExt" != "jar" ]]; then
+      cp -a "$file" "$OUTPUT_SYS/$relDir/"
+      continue
+    fi
+
+    # If APKs selection enabled, skip if not in list
+    if [ $hasBytecodeList = true ]; then
+      if ! array_contains "$relFile" "${BYTECODE_LIST[@]}"; then
+        continue
+      fi
+    fi
+
+    # For APK/jar files apply de-optimization
+    zipRoot=$(dirname "$file")
+    pkgName=$(basename "$file" ".$fileExt")
+
+    # Check if APK/jar bytecode is pre-optimized
+    odexFound=0
+    if [ -d "$zipRoot/oat" ]; then
+      # Check if optimized code available at app's directory
+      odexFound=$(find "$zipRoot/oat" -type f -iname "$pkgName*.odex" | \
+                  wc -l | tr -d ' ')
+    fi
+    if [ $odexFound -eq 0 ]; then
+      # shellcheck disable=SC2015
+      zipinfo "$file" classes.dex &>/dev/null && {
+        echo "[!] '$relFile' not pre-optimized with sanity checks passed - copying without changes"
+      } || {
+        echo "[!] '$relFile' not pre-optimized & without 'classes.dex' - copying without changes"
+      }
+      cp -a "$file" "$OUTPUT_SYS/$relDir"
+    else
+      deoptDir="$TMP_WORK_DIR/$pkgName/deopt"
+      mkdir -p "$deoptDir"
+
+      # If pre-compiled, de-optimize to original DEX bytecode
+      deoptSuccess=false
+      for abi in ${ABIS[@]}
+      do
+        curOdex="$zipRoot/oat/$abi/$pkgName.odex"
+        if [ ! -f "$curOdex" ]; then
+          continue
+        fi
+
+        # If we already have bytecode de-optimized for one ABI don't redo the work
+        # just create the dir annotation to pickup multi-lib both scenarios
+        if [ $deoptSuccess = true ]; then
+          mkdir -p "$OUTPUT_SYS/$relDir/oat/$abi"
+          continue
+        fi
+
+        # clean bits that might have left from previous ABI run
+        rm -rf "{$deoptDir/*:?}"
+
+        # Since baksmali is not automatically picking all dex entries inside an OAT
+        # file, we first need to enumerate them. For that purpose we use oatdump tool
+        dexFiles=""
+        dexFiles="$($OATDUMP_BIN --oat-file="$curOdex" --no-disassemble --no-dump:vmap \
+          --class-filter=InvalidFilterToSpeedThings | grep OatDexFile -A1 | \
+          grep "^location:" | cut -d ":" -f2- | sed 's/^ *//g')"
+
+        if [[ "$dexFiles" == "" ]]; then
+          echo "[-] Failed to detect dex entries at '$curOdex' OAT file"
+          abort 1
+        fi
+
+        counter=1
+        while read -r dexEntry
+        do
+          java -jar "$BAKSMALI_JAR" x -o "$deoptDir" -d "$TMP_WORK_DIR/$abi" \
+                    "$curOdex" &>/dev/null || {
+            echo "[-] '$relFile/oat/$abi/$pkgName.odex' baksmali failed"
+            abort 1
+          }
+
+          if [ $counter -eq 1 ]; then
+            deoptDexOut="$TMP_WORK_DIR/$pkgName/classes.dex"
+          else
+            deoptDexOut="$TMP_WORK_DIR/$pkgName/classes$counter.dex"
+          fi
+
+          java -jar "$SMALI_JAR" a "$deoptDir" -o "$deoptDexOut" &>/dev/null || {
+            echo "[-] '$relFile/oat/$abi/$pkgName.odex' smali failed"
+            abort 1
+          }
+
+          if [[ ! -f "$deoptDexOut" || ! -s "$deoptDexOut" ]]; then
+            echo "[-] Missing generated dex file when repairing '$relFile/oat/$abi/$pkgName.odex'"
+            abort 1
+          fi
+
+          counter=$(( counter + 1))
+        done < <(echo "$dexFiles")
+
+        # Generate an empty directory under package dir with the detected ABI
+        # so that vendor generate script can detect possible multilib scenarios
+        mkdir -p "$OUTPUT_SYS/$relDir/oat/$abi"
+        deoptSuccess=true
+      done
+
+      # Copy APK/jar to workspace for repair
+      cp "$file" "$TMP_WORK_DIR"
+
+      # Add dex files back to zip archives (jar or APK) considering possible
+      # multi-dex case. zipalign is not necessary since AOSP build rules will
+      # align them if not already.
+      find "$TMP_WORK_DIR/$pkgName" -maxdepth 1 -name "*.dex" | while read -r dexFile
+      do
+        dexEntry="$(basename "$dexFile")"
+        jar -uf "$TMP_WORK_DIR/$fileName" -C "$TMP_WORK_DIR/$pkgName" \
+             "$dexEntry" &>/dev/null || {
+          echo "[-] '$fileName' $dexEntry append failed"
+          abort 1
+        }
+        rm "$dexFile"
+      done
+
+      # Remove old signature from APKs so that we don't create problems with V2 sign format
+      if [[ "$fileExt" == "apk" ]]; then
+        zip -d "$TMP_WORK_DIR/$fileName" META-INF/\* &>/dev/null
+      fi
+
+      cp "$TMP_WORK_DIR/$fileName" "$OUTPUT_SYS/$relDir"
+    fi
+  done < <(find "$INPUT_DIR" -not -type d)
+}
+
+check_dir() {
+  local dirPath="$1"
+  local dirDesc="$2"
+
+  if [[ "$dirPath" == "" || ! -d "$dirPath" ]]; then
+    echo "[-] $dirDesc directory not found"
+    usage
+  fi
+}
+
+check_opt_file() {
+  local filePath="$1"
+  local fileDesc="$2"
+
+  if [[ "$filePath" != "" && ! -f "$filePath" ]]; then
+    echo "[-] '$fileDesc' file not found"
+    usage
+  fi
+}
+
 trap "abort 1" SIGINT SIGTERM
 
 # Check that system tools exist
@@ -461,6 +675,8 @@ BYTECODE_LIST_FILE=""
 OAT2DEX_JAR=""
 OATDUMP_BIN=""
 DEXREPAIR_BIN=""
+SMALI_JAR=""
+BAKSMALI_JAR=""
 
 # Global variables accessible from sub-routines
 declare -a BYTECODE_LIST
@@ -494,6 +710,14 @@ do
       DEXREPAIR_BIN="$2"
       shift
       ;;
+    --smali)
+      SMALI_JAR="$2"
+      shift
+      ;;
+    --baksmali)
+      BAKSMALI_JAR="$2"
+      shift
+      ;;
     --bytecode-list)
       BYTECODE_LIST_FILE="$2"
       shift
@@ -506,34 +730,26 @@ do
   shift
 done
 
-if [[ "$INPUT_DIR" == "" || ! -d "$INPUT_DIR" ]]; then
-  echo "[-] Input directory not found"
-  usage
-fi
-if [[ "$OUTPUT_DIR" == "" || ! -d "$OUTPUT_DIR" ]]; then
-  echo "[-] Output directory not found"
-  usage
-fi
-if [[ "$REPAIR_METHOD" != "NONE" && "$REPAIR_METHOD" != "OAT2DEX" && "$REPAIR_METHOD" != "OATDUMP" ]]; then
+# Input args check
+if [[ "$REPAIR_METHOD" != "NONE" && "$REPAIR_METHOD" != "OAT2DEX" && \
+      "$REPAIR_METHOD" != "OATDUMP" && "$REPAIR_METHOD" != "SMALIDEODEX" ]]; then
   echo "[-] Invalid repair method"
   usage
 fi
-if [[ "$OAT2DEX_JAR" != "" && ! -f "$OAT2DEX_JAR" ]]; then
-  echo "[-] oat2dex.jar not found"
-  usage
-fi
-if [[ "$OATDUMP_BIN" != "" && ! -f "$OATDUMP_BIN" ]]; then
-  echo "[-] oatdump bin not found"
-  usage
-fi
-if [[ "$DEXREPAIR_BIN" != "" && ! -f "$DEXREPAIR_BIN" ]]; then
-  echo "[-] dexrepair bin not found"
-  usage
-fi
-if [[ "$BYTECODE_LIST_FILE" != "" && ! -f "$BYTECODE_LIST_FILE" ]]; then
-  echo "[-] '$BYTECODE_LIST_FILE' file not found"
-  usage
-fi
+check_dir "$INPUT_DIR" "Input"
+check_dir "$OUTPUT_DIR" "Output"
+
+# Bytecode list filter file is optional
+check_opt_file "$BYTECODE_LIST_FILE" "BYTECODE_LIST_FILE"
+
+# Check optional tool paths if set. Each repair method rechecks that required
+# tools are set prior to start processing
+check_opt_file "$OAT2DEX_JAR" "oat2dex.jar"
+check_opt_file "$OATDUMP_BIN" "oatdump"
+check_opt_file "$DEXREPAIR_BIN" "dexrepair"
+check_opt_file "$SMALI_JAR" "smali.jar"
+check_opt_file "$BAKSMALI_JAR" "baksmali.jar"
+
 
 # Verify input is an Android system partition
 if [ ! -f "$INPUT_DIR/build.prop" ]; then
@@ -546,14 +762,11 @@ OUTPUT_SYS="$OUTPUT_DIR/system"
 if [[ -d "$OUTPUT_SYS" && $(ls -A "$OUTPUT_SYS" | grep -v '^\.') ]]; then
   echo "[!] Output directory should be empty to avoid merge problems with old extracts"
   abort 1
-else
-  mkdir -p "$OUTPUT_SYS"
 fi
 
 # Verify image contains pre-optimized oat files
 if [ ! -d "$INPUT_DIR/framework/oat" ]; then
   echo "[!] System partition doesn't contain any pre-optimized files - link to original partition"
-  rmdir "$OUTPUT_SYS"
   ln -sfn "$INPUT_DIR" "$OUTPUT_SYS"
   abort 0
 fi
@@ -561,7 +774,6 @@ fi
 # No repairing
 if [[ "$REPAIR_METHOD" == "NONE" ]]; then
   echo "[*] No repairing enabled - link to original partition"
-  rmdir "$OUTPUT_SYS"
   ln -sfn "$INPUT_DIR" "$OUTPUT_SYS"
   abort 0
 fi
@@ -570,11 +782,19 @@ fi
 # JARs under /system/framework are always repaired for safety
 if [[ "$BYTECODE_LIST_FILE" != "" ]]; then
   readarray -t BYTECODE_LIST < <(grep -Ev '(^#|^$)' "$BYTECODE_LIST_FILE")
+  if [ ${#BYTECODE_LIST[@]} -eq 0 ]; then
+    echo "[!] No bytecode files selected for repairing - link to original partition"
+    ln -sfn "$INPUT_DIR" "$OUTPUT_SYS"
+    abort 0
+  fi
   echo "[*] '${#BYTECODE_LIST[@]}' bytecode archive files will be repaired"
   hasBytecodeList=true
 else
   echo "[*] All bytecode files under system partition will be repaired"
 fi
+
+# Prepare output directory base
+mkdir -p "$OUTPUT_SYS"
 
 # oat2dex repairing
 if [[ "$REPAIR_METHOD" == "OAT2DEX" ]]; then
@@ -600,6 +820,13 @@ elif [[ "$REPAIR_METHOD" == "OATDUMP" ]]; then
 
   echo "[*] Repairing bytecode under /system partition using oatdump method"
   oatdump_repair
+elif [[ "$REPAIR_METHOD" == "SMALIDEODEX" ]]; then
+  if [[ "$OATDUMP_BIN" == "" || "$SMALI_JAR" == "" || "$BAKSMALI_JAR" == "" ]]; then
+    echo "[-] Missing oatdump and/or smali/baksmali external tool(s)"
+    abort 1
+  fi
+  echo "[*] Repairing bytecode under /system partition using smali deodex method"
+  smali_repair
 fi
 
 echo "[*] System partition successfully extracted & repaired at '$OUTPUT_DIR'"

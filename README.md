@@ -1,12 +1,11 @@
 ## Introduction
-
 For latest Android Nexus devices (N5x, N6p, N9 LTE/WiFi), Google is no longer
 providing vendor binary archives to be included into AOSP build tree.
 Officially it is claimed that all vendor proprietary blobs have been moved to
 `/vendor` partition, which allegedly doesn't need building from users.
-Unfortunately, that is not the case since quite a few vendor executables, DSOs
-and APKs/JARs required in order to have a fully functional set of images, are present
-under `/system`, although missing from AOSP public tree. Additionally, if
+Unfortunately, that is not the case since quite a few proprietary executables, DSOs
+and APKs/JARs located under `/system` are required in order to have a fully
+functional set of images, although missing from AOSP public tree. Additionally, if
 `vendor.img` is not generated when `system.img` is prepared for build, a few bits
 are broken that also require manual fixing (various symbolic links between two
 partitions, bytecode product packages, vendor shared libs dependencies, etc.).
@@ -16,9 +15,9 @@ However until then, missing blobs need to be manually extracted from factory
 images, processed and included into AOSP tree. These processing steps are evolving
 into a total nightmare considering that all recent factory images have their
 bytecode (APKs, JARs) pre-optimized to reduce boot time and their original
-`classes.dex` stripped to reduce disk size. As such, these missing pre-built
+`classes.dex` stripped to reduce disk size. As such, these missing prebuilt
 components need to be repaired/de-optimized prior to be included, since AOSP build
-is not capable to import pre-optimized modules as part of the makefile tree.
+is not capable to import pre-optimized bytecode modules as part of the makefile tree.
 
 Scripts & tools included in this repository aim to automate the extraction,
 processing and generation of vendor specific data using factory images as
@@ -37,24 +36,22 @@ patches are more than welcome though.
 
 
 ## Required steps summary
-
 The process to extract and import vendor proprietary blobs requires to:
 
 1. Obtain device matching factory images archive from Google developer website
 (`scripts/download-nexus-image.sh`)
-2. Extract images from archive, convert from sparse to raw, mount to with fuse-ext2 &
+  * Users need to accept Google ToS for Nexus factory images
+2. Extract images from archive, convert from sparse to raw, mount with fuse-ext2 &
 extract data (`scripts/extract-factory-images.sh`)
-  * All vendor partition data are mirror in order to generate a production identical `vendor.img`
-3. Repair bytecode (APKs/JARs) from factory system image (`scripts/system-img-repair.sh`)
-  * **API >= 24**: Use oatdump ART host tool to extract DEX from OAT ELF .rodata section
-  & dexRepair to fix signatures (more info [here](https://github.com/anestisb/android-prepare-vendor/issues/22))
-  * **API = 23**: Use SmaliEx to de-odex bytecode
+  * All vendor partition data are mirrored in order to generate a production identical `vendor.img`
+3. Repair bytecode (APKs/JARs) from factory system image (`scripts/system-img-repair.sh`) using one
+of supported bytecode de-optimization methods (see next paragraph for details)
 4. Generate vendor proprietary includes & makefiles compatible with AOSP build tree
 (`scripts/generate-vendor.sh`)
-  * Extra care in Makefile rules to not break compatibility among AOSP versions
+  * Extra care in Makefile rules to not break compatibility among supported AOSP branches
 
 `execute-all.sh` runs all previous steps with required order. As an alternative to
-download images from Google's websize, script can also read factory images from
+download images from Google's website, script can also read factory images from
 file-system location using the `-i|--img` flag.
 
 `-k|--keep` flag can be used if you want to keep extracted intermediate files for further
@@ -62,12 +59,33 @@ investigation. Keep in mind that if used the mount-points from fuse-ext2 are not
 So be sure that you manually remove them (or run the script again without the flag) when done.
 
 All scripts can be executed from OS X, Linux & other Unix-based systems as long
-as `fuse-ext2` and other utilized command line tools are installed. Scripts will
-abort if any of the required tools is missing from the host.
+as `fuse-ext2`, bash 4.x and other utilized command line tools are installed.
+Scripts will abort if any of the required tools is missing from the host.
 
 Scripts include individual usage info and additional flags that be used for
 targeted advanced actions, bugs investigation & development of new features.
 
+## Supported bytecode de-optimization methods
+### oatdump (Default for API-24 or `--oatdump` flag)
+Use oatdump host tool (`platform/art` project from AOSP) to extract DEX bytecode from OAT's
+ELF `.rodata` section. Extracted DEX is not identical to original since DEX-to-DEX compiler
+transformations have already been applied when code was pre-optimized
+(more info [here](https://github.com/anestisb/oatdump_plus#dex-to-dex-optimisations)).
+[dexrepair](https://github.com/anestisb/dexRepair) is also used to repair the extracted
+DEX file CRC checksum prior to appending bytecode back to matching APK package from which
+it has been originally stripped. More info about this method [here](https://github.com/anestisb/android-prepare-vendor/issues/22).
+
+### baksmali / smali (`--smali` flag)
+Use baksmali disassembler against target OAT file to generate a smali syntaxed output.
+Disassembling process relies on boot framework files (which are automatically include)
+to resolve class dependencies. Baksmali output is then forwarded to smali assembler
+to generate a functionally equivalent DEX bytecode file.
+
+### SmaliEx *[DEPRECATED]* (Default for API-23 or `--smaliex` flag)
+SmaliEx is an automation tool that is using baksmali/smali at the background and is
+smoothly handling all the required disassembler/assembler iterations and error handling.
+Unfortunately due to not quickly catching-up with upstream smali & dexlib it has been
+deprecated for now.
 
 ## Configuration files explained
 ### Naked vs GPlay
@@ -104,31 +122,29 @@ Additional target modules (with compatible structure based on rule build type) t
 be appended at master vendor `Android.mk`.
 
 
-## Android M (API-23) supported devices
-
-* angler - Nexus 6p
-* bullhead - Nexus 5x
-* flounder - Nexus 9 WiFi (volantis)
-* flounder - Nexus 9 LTE (volantisg)
-
-## Android N (API-24) supported devices
-
-* angler - Nexus 6p
-* bullhead - Nexus 5x
-* flounder - Nexus 9 WiFi (volantis)
-
-`Nexus 9 LTE will be supported as soon as Google releases Nougat factory images`
-
+## Supported devices
+| Device                          | API 23                      | API 24           |
+| ------------------------------- | --------------------------- | -----------------|
+| N5x bullhead                    | smaliex<br>smali<br>oatdump | oatdump<br>smali |
+| N6p angler                      | smaliex<br>smali<br>oatdump | oatdump<br>smali |
+| N9 flounder<br> WiFi (volantis) | smaliex<br>smali<br>oatdump | oatdump<br>smali |
+| N9 flounder<br> LTE (volantisg) | smaliex<br>smali<br>oatdump | oatdump<br>smali |
 
 ## Contributing
-
 If you want to contribute to device configuration files, please test against the
 target device before any pull request.
 
 ## Change Log
+* 0.1.7 - 8 Oct 2016
+ * Nexus 9 LTE (volantisg) support
+ * Offer option to de-optimize all packages under /system despite configuration settings
+ * Deprecate SmaliEx and use baksmali/smali as an alternative method to deodex bytecode
+ * Improve supported bytecode deodex methods modularity - users can now override default methods
+ * Global flag to disable /system `LOCAL_DEX_PREOPT` overrides from vendor generate script
+ * Respect `LOCAL_MULTILIB` `32` or `both` when 32bit bytecode prebuilts detected at 64bit devices
 * 0.1.6 - 4 Oct 2016
  * Download automation compatibility with refactored Google Nexus images website
- * Bug fixes when generating from MAC
+ * Bug fixes when generating from OS X
 * 0.1.5 - 25 Sep 2016
  * Fixes issue with symlinks resolve when output path with spaces
  * Fixes bug when repairing multi-dex APKs with oatdump method
@@ -157,7 +173,8 @@ target device before any pull request.
  * AOSP compatibility bug fixes & performance optimizations
 
 ## Warnings
-
+* Scripts do **NOT** require root permissions to run. If you're facing problems
+with `fuse-ext2` configuration at your environment, check the following FAQ section.
 * No binary vendor data against supported devices will be maintained in this
 repository. Scripts provide all necessary automation to generate them yourself.
 * No promises on how the device configuration files will be maintained. Feel free
@@ -169,158 +186,116 @@ keep them updated.
 included, you have other vendor makefiles that define the same packages (e.g.
 hammerhead vs bullhead from LGE). This issue is due to the developers of
 conflicted vendor makefiles didn't bother to wrap them with
-`ifeq ($TARGET_DEVICE),<device_model>)`. Wrap conflicting makefiles with
+`ifeq ($(TARGET_DEVICE),<device_model>)`. Wrap conflicting makefiles with
 device matching clauses to resolve the issue.
-* If deprecated SmaliEx method for API-23 is chosen, Java 8 is required for
-the bytecode de-optimization process to work.
-* Bytecode repaired with oatdump method cannot be pre-optimized. As such generated
-rules have `LOCAL_DEXPREOPT := false`. This is because host dex2oatd is invoked with
-more strict flags and results into aborting when front-end reaches already optimized
-instructions.
+* If Smali or SmaliEx de-optimization method is chosen, Java 8 is required for
+the bytecode repair process to work.
+* Bytecode repaired with oatdump method cannot be pre-optimized when building AOSP.
+As such generated targets have `LOCAL_DEXPREOPT := false`. This is because host
+dex2oat is invoked with more strict flags and results into aborting when front-end
+reaches already optimized instructions. You can use `--force-opt` flag if you have
+modified the defailt host dex2oat bytecode precompile flags.
 * If you're planning to deliver OTA updates for Nexus 5x, you need to manually extract
 `update-binary` from a factory OTA archive since it's missing from AOSP tree due to some
 proprietary LG code.
+* Nexus 9 WiFi (volantis) & Nexus 9 LTE (volantisg) vendor blobs cannot co-exist under
+same AOSP root directory. Since AOSP defines a single flounder target for both boards
+lots of definitions will conflict and create problems when building. As such ensure
+that only one of them is present when building for desired target. Generated makefiles
+include an additional defensive check that will raise a compiler error when both are
+detected under same AOSP root.
 
 ## Frequently Spotted Issues
 ### fuse-ext2
 * `fusermount: failed to open /etc/fuse.conf: Permission denied`
  * FIX-1: Add low privilege username to fuse group (e.g.: `# usermod -a -G fuse anestisb`)
- * FIX-2: Change file permissions - `# chmod +r /etc/fuse.conf
+ * FIX-2: Change file permissions - `# chmod +r /etc/fuse.conf`
 * `fusermount: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf`
  * Edit `/etc/fuse.conf` and write/uncomment the `user_allow_other` flag
 
 ## Examples
-### API-24 (Nougat) N9 WiFi flounder with alias (volantis) vendor generation after downloading factory image from website
+### API-24 (Nougat) N9 WiFi (alias volantis) flounder vendor generation after downloading factory image from website
 ```
-anestisb@aosp-build::android-prepare-vendor$ ./execute-all.sh -d flounder -a volantis -b nrd90r -o $(pwd)
-[*] Setting output base to '/aosp_b_prod/android-prepare-vendor/flounder/nrd90r'
-[*] Downloading image from 'https://dl.google.com/dl/android/aosp/volantis-nrd90r-factory-84de678f.zip'
---2016-09-11 11:57:14--  https://dl.google.com/dl/android/aosp/volantis-nrd90r-factory-84de678f.zip
-Resolving dl.google.com (dl.google.com)... 62.75.10.104, 62.75.10.118, 62.75.10.84, ...
-Connecting to dl.google.com (dl.google.com)|62.75.10.104|:443... connected.
+$ ./execute-all.sh -d flounder -a volantis -b NRD91D -o /fast-datavault/nexus-vendor-blobs
+[*] Setting output base to '/fast-datavault/nexus-vendor-blobs/flounder/nrd91d'
+
+--{ Google Terms and Conditions
+Downloading of the system image and use of the device software is subject to the
+Google Terms of Service [1]. By continuing, you agree to the Google Terms of
+Service [1] and Privacy Policy [2]. Your downloading of the system image and use
+of the device software may also be subject to certain third-party terms of
+service, which can be found in Settings > About phone > Legal information, or as
+otherwise provided.
+
+[1] https://www.google.com/intl/en/policies/terms/
+[2] https://www.google.com/intl/en/policies/privacy/
+
+[?] I have read and agree with the above terms and conditions - ACKNOWLEDGE [y|n]: y
+[*] Downloading image from 'https://dl.google.com/dl/android/aosp/volantis-nrd91d-factory-a27db9bc.zip'
+--2016-10-05 21:53:17--  https://dl.google.com/dl/android/aosp/volantis-nrd91d-factory-a27db9bc.zip
+Resolving dl.google.com (dl.google.com)... 173.194.76.93, 173.194.76.190, 173.194.76.136, ...
+Connecting to dl.google.com (dl.google.com)|173.194.76.93|:443... connected.
 HTTP request sent, awaiting response... 200 OK
-Length: 793127173 (756M) [application/zip]
-Saving to: ‘/aosp_b_prod/android-prepare-vendor/flounder/nrd90r/volantis-nrd90r-factory-84de678f.zip’
+Length: 793140236 (756M) [application/zip]
+Saving to: ‘/fast-datavault/nexus-vendor-blobs/flounder/nrd91d/volantis-nrd91d-factory-a27db9bc.zip’
 
-/aosp_b_prod/android-prepare-vendor/flounder/ 100%[================================================================================================>] 756.38M  1.21MB/s   in 10m 30ss
+s/flounder/nrd91d/volantis-nrd91d-factory-a27db9bc.zip  96%[======================================================================================================================>    ] 733.49M  1.22MB/s    eta 19s    ^/fast-datavault/nexus-vendor-blobs/flounder/nrd91d/vol 100%[==========================================================================================================================>] 756.40M  1.19MB/s    in 10m 21s
 
-2016-09-11 12:07:45 (1.20 MB/s) - ‘/aosp_b_prod/android-prepare-vendor/flounder/nrd90r/volantis-nrd90r-factory-84de678f.zip’ saved [793127173/793127173]
+2016-10-05 22:03:39 (1.22 MB/s) - ‘/fast-datavault/nexus-vendor-blobs/flounder/nrd91d/volantis-nrd91d-factory-a27db9bc.zip’ saved [793140236/793140236]
 
-[*] Processing with 'API-24' configuration
-[*] Extracting '/aosp_b_prod/android-prepare-vendor/flounder/nrd90r/volantis-nrd90r-factory-84de678f.zip'
-[*] Unzipping 'image-volantis-nrd90r.zip'
-[*] First run detected - downloading oatdump host bin & lib dependencies
---2016-09-11 12:08:30--  https://onedrive.live.com/download?cid=D1FAC8CC6BE2C2B0&resid=D1FAC8CC6BE2C2B0%21467&authkey=ADsdFhslWvJwuO8
-Resolving onedrive.live.com (onedrive.live.com)... 204.79.197.217
-Connecting to onedrive.live.com (onedrive.live.com)|204.79.197.217|:443... connected.
-HTTP request sent, awaiting response... 302 Found
-Location: https://jnq3da.bl3301.livefilestore.com/y3maU_6cHZqrFOKIqYCP39w-X6JOEjYHC__YrioLdqyCGcZelZRE4elpyiTo6rxjd3LvaNhpItcXgBrD9ztKo4YNR0V8k1VQRD6bM4ob7AJ_pOfWVPWXZJJEwZMS2dzplO-QC2Rn9qHPG3H0ELsyzVevq5MJnp87QZx_iThNQM1xtE/Linux_oatdump_bin_deps.zip?download&psid=1 [following]
---2016-09-11 12:08:31--  https://jnq3da.bl3301.livefilestore.com/y3maU_6cHZqrFOKIqYCP39w-X6JOEjYHC__YrioLdqyCGcZelZRE4elpyiTo6rxjd3LvaNhpItcXgBrD9ztKo4YNR0V8k1VQRD6bM4ob7AJ_pOfWVPWXZJJEwZMS2dzplO-QC2Rn9qHPG3H0ELsyzVevq5MJnp87QZx_iThNQM1xtE/Linux_oatdump_bin_deps.zip?download&psid=1
-Resolving jnq3da.bl3301.livefilestore.com (jnq3da.bl3301.livefilestore.com)... 204.79.197.213
-Connecting to jnq3da.bl3301.livefilestore.com (jnq3da.bl3301.livefilestore.com)|204.79.197.213|:443... connected.
-HTTP request sent, awaiting response... 200 OK
-Length: 73497410 (70M) [application/zip]
-Saving to: ‘/aosp_b_prod/android-prepare-vendor/hostTools/Linux/oatdump_deps.zip’
-
-/aosp_b_prod/android-prepare-vendor/hostTools 100%[================================================================================================>]  70.09M  1.19MB/s   in 59s
-
-2016-09-11 12:09:38 (1.19 MB/s) - ‘/aosp_b_prod/android-prepare-vendor/hostTools/Linux/oatdump_deps.zip’ saved [73497410/73497410]
-
+[*] Processing with 'API-24 config-naked' configuration
+[*] Extracting '/fast-datavault/nexus-vendor-blobs/flounder/nrd91d/volantis-nrd91d-factory-a27db9bc.zip'
+[*] Unzipping 'image-volantis-nrd91d.zip'
+[!] No baseband firmware present - skipping
 [!] System partition doesn't contain any pre-optimized files - link to original partition
 [*] Generating blobs for vendor/htc/flounder
-[*] Copying files to '/aosp_b_prod/android-prepare-vendor/flounder/nrd90r/vendor/htc/flounder'
-[*] Generating 'flounder-vendor-blobs.mk' makefile
+[*] Copying radio files '/fast-datavault/nexus-vendor-blobs/flounder/nrd91d/vendor/htc/flounder'
+[*] Copying product files & generating 'flounder-vendor-blobs.mk' makefile
 [*] Generating 'device-vendor.mk'
+[*] Generating 'AndroidBoardVendor.mk'
+  [*] Bootloader:3.48.0.0139
 [*] Generating 'BoardConfigVendor.mk'
+[*] Generating 'vendor-board-info.txt'
 [*] Generating 'Android.mk'
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/flounder/nrd90r/vendor/htc/flounder/vendor/app' APK/JAR pre-builts
+[*] Gathering data from 'vendor/app' APK/JAR pre-builts
+[*] Generating signatures file
 [*] All actions completed successfully
-[*] Import '/aosp_b_prod/android-prepare-vendor/flounder/nrd90r/vendor' to AOSP root
+[*] Import '/fast-datavault/nexus-vendor-blobs/flounder/nrd91d/vendor' to AOSP root
 ```
 
-### API-24 (Nougat) N6p vendor generation after downloading factory image from website
+### API-23 (Marshmallow) N5x vendor generation using factory image from file-system
 ```
-anestisb@aosp-build:android-prepare-vendor$ ./execute-all.sh -d angler -b nrd90u -o $(pwd)
-[*] Setting output base to '/aosp_b_prod/android-prepare-vendor/angler/nrd90u'
-[*] Downloading image from 'https://dl.google.com/dl/android/aosp/angler-nrd90u-factory-7c9b6a2b.zip'
---2016-09-11 12:39:37--  https://dl.google.com/dl/android/aosp/angler-nrd90u-factory-7c9b6a2b.zip
-Resolving dl.google.com (dl.google.com)... 172.217.21.14, 2a00:1450:4017:805::200e
-Connecting to dl.google.com (dl.google.com)|172.217.21.14|:443... connected.
-HTTP request sent, awaiting response... 200 OK
-Length: 1247407454 (1.2G) [application/zip]
-Saving to: ‘/aosp_b_prod/android-prepare-vendor/angler/nrd90u/angler-nrd90u-factory-7c9b6a2b.zip’
-
-/aosp_b_prod/android-prepare-vendor/angler/nr 100%[================================================================================================>]   1.16G  1.13MB/s   in 16m 55ss
-
-2016-09-11 12:56:32 (1.17 MB/s) - ‘/aosp_b_prod/android-prepare-vendor/angler/nrd90u/angler-nrd90u-factory-7c9b6a2b.zip’ saved [1247407454/1247407454]
-
-[*] Processing with 'API-24' configuration
-[*] Extracting '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/angler-nrd90u-factory-7c9b6a2b.zip'
-[*] Unzipping 'image-angler-nrd90u.zip'
-[*] '17' bytecode archive files will be repaired
-[*] Repairing bytecode under /system partition using oatdump method
-[*] System partition successfully extracted & repaired at '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/factory_imgs_repaired_data'
-[!] Target device expects to have following img versions when using output system img
- [*] Booatloder:angler-03.58
- [*] Baseband:angler-03.72
-[*] Generating blobs for vendor/huawei/angler
-[*] Copying files to '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/vendor/huawei/angler'
-[*] Generating 'angler-vendor-blobs.mk' makefile
-[*] Generating 'device-vendor.mk'
-[*] Generating 'BoardConfigVendor.mk'
-[*] Generating 'Android.mk'
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/vendor/huawei/angler/vendor/app' APK/JAR pre-builts
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/vendor/huawei/angler/proprietary/app' APK/JAR pre-builts
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/vendor/huawei/angler/proprietary/framework' APK/JAR pre-builts
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/vendor/huawei/angler/proprietary/priv-app' APK/JAR pre-builts
-[*] Gathering data for shared library (.so) pre-built modules
-[*] All actions completed successfully
-[*] Import '/aosp_b_prod/android-prepare-vendor/angler/nrd90u/vendor' to AOSP root
-```
-
-### API-23 (Marshmallow) N5x vendor generation after downloading factory image from website
-```
-anestisb@aosp-build:android-prepare-vendor$ ./execute-all.sh -d bullhead -b MTC20K -o $(pwd)
-[*] Setting output base to '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k'
-[*] Downloading image from 'https://dl.google.com/dl/android/aosp/bullhead-mtc20k-factory-4a950470.zip'
---2016-09-11 12:13:12--  https://dl.google.com/dl/android/aosp/bullhead-mtc20k-factory-4a950470.zip
-Resolving dl.google.com (dl.google.com)... 216.58.208.46, 2a00:1450:4017:803::200e
-Connecting to dl.google.com (dl.google.com)|216.58.208.46|:443... connected.
-HTTP request sent, awaiting response... 200 OK
-Length: 964936536 (920M) [application/zip]
-Saving to: ‘/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/bullhead-mtc20k-factory-4a950470.zip’
-
-/aosp_b_prod/android-prepare-vendor/bullhead/ 100%[================================================================================================>] 920.23M  1.19MB/s   in 12m 56ss
-
-2016-09-11 12:26:09 (1.19 MB/s) - ‘/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/bullhead-mtc20k-factory-4a950470.zip’ saved [964936536/964936536]
-
-[*] Processing with 'API-23' configuration
-[*] Extracting '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/bullhead-mtc20k-factory-4a950470.zip'
+$ ./execute-all.sh -d bullhead -i /fast-datavault/nexus-vendor-blobs/bullhead/mtc20k/bullhead-mtc20k-factory-4a950470.zip -b mtc20k -o /fast-datavault/nexus-vendor-blobs
+[*] Setting output base to '/fast-datavault/nexus-vendor-blobs/bullhead/mtc20k'
+[*] Processing with 'API-23 config-naked' configuration
+[*] Extracting '/fast-datavault/nexus-vendor-blobs/bullhead/mtc20k/bullhead-mtc20k-factory-4a950470.zip'
 [*] Unzipping 'image-bullhead-mtc20k.zip'
 [*] '20' bytecode archive files will be repaired
 [*] Repairing bytecode under /system partition using oat2dex method
 [*] Preparing environment for 'arm' ABI
 [*] Preparing environment for 'arm64' ABI
 [*] Start processing system partition & de-optimize pre-compiled bytecode
-[*] '/framework/cneapiclient.jar' not pre-optimized with sanity checks passed - copying without changes
-[-] '/framework/framework-res.apk' not pre-optimized & without 'classes.dex' - skipping
+[!] '/framework/cneapiclient.jar' not pre-optimized with sanity checks passed - copying without changes
+[!] '/framework/framework-res.apk' not pre-optimized & without 'classes.dex' - copying without changes
 [*] '/framework/framework.jar' is multi-dex - adjusting recursive archive adds
-[*] '/framework/rcsimssettings.jar' not pre-optimized with sanity checks passed - copying without changes
-[*] '/framework/rcsservice.jar' not pre-optimized with sanity checks passed - copying without changes
-[*] System partition successfully extracted & repaired at '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/factory_imgs_repaired_data'
-[!] Target device expects to have following img versions when using output system img
- [*] Booatloder:BHZ10r
- [*] Baseband:M8994F-2.6.32.1.13
+[!] '/framework/rcsimssettings.jar' not pre-optimized with sanity checks passed - copying without changes
+[!] '/framework/rcsservice.jar' not pre-optimized with sanity checks passed - copying without changes
+[*] System partition successfully extracted & repaired at '/fast-datavault/nexus-vendor-blobs/bullhead/mtc20k/factory_imgs_repaired_data'
 [*] Generating blobs for vendor/lge/bullhead
-[*] Copying files to '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/vendor/lge/bullhead'
-[*] Generating 'bullhead-vendor-blobs.mk' makefile
+[*] Copying radio files '/fast-datavault/nexus-vendor-blobs/bullhead/mtc20k/vendor/lge/bullhead'
+[*] Copying product files & generating 'bullhead-vendor-blobs.mk' makefile
 [*] Generating 'device-vendor.mk'
+[*] Generating 'AndroidBoardVendor.mk'
+  [*] Bootloader:BHZ10r
+  [*] Baseband:M8994F-2.6.32.1.13
 [*] Generating 'BoardConfigVendor.mk'
+[*] Generating 'vendor-board-info.txt'
 [*] Generating 'Android.mk'
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/vendor/lge/bullhead/vendor/app' APK/JAR pre-builts
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/vendor/lge/bullhead/proprietary/app' APK/JAR pre-builts
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/vendor/lge/bullhead/proprietary/framework' APK/JAR pre-builts
-[*] Gathering data from '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/vendor/lge/bullhead/proprietary/priv-app' APK/JAR pre-builts
+[*] Gathering data from 'vendor/app' APK/JAR pre-builts
+[*] Gathering data from 'proprietary/app' APK/JAR pre-builts
+[*] Gathering data from 'proprietary/framework' APK/JAR pre-builts
+[*] Gathering data from 'proprietary/priv-app' APK/JAR pre-builts
+[*] Generating signatures file
 [*] All actions completed successfully
-[*] Import '/aosp_b_prod/android-prepare-vendor/bullhead/mtc20k/vendor' to AOSP root
+[*] Import '/fast-datavault/nexus-vendor-blobs/bullhead/mtc20k/vendor' to AOSP root
 ```
